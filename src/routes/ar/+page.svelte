@@ -1,9 +1,10 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import { ensureSession } from '$lib/supabase';
-	import { getProfile, nearbyTags, placeTag, appraiseTag, reportTag } from '$lib/api';
-	import { ArSession, offsetLatLon } from '$lib/ar/session';
+	import { getProfile, getTag, nearbyTags, placeTag, appraiseTag, reportTag } from '$lib/api';
+	import { ArSession, offsetLatLon, distanceM, bearingDeg } from '$lib/ar/session';
 	import { LIBRARY } from '$lib/library';
 	import { SIZE_COST, type NearbyTag, type Profile, type SizeClass } from '$lib/types';
 
@@ -29,7 +30,13 @@
 	let tags = $state<NearbyTag[]>([]);
 	let selectedTag = $state<NearbyTag | null>(null);
 
+	// Focus mode: /ar?t=<id> guides the user to one specific tag.
+	let focusTag = $state<NearbyTag | null>(null);
+	let focusDistance = $state<number | null>(null);
+	let arrowRotation = $state(0);
+
 	let pollTimer: ReturnType<typeof setInterval> | undefined;
+	let arrowTimer: ReturnType<typeof setInterval> | undefined;
 	let lastFetchAt: { lat: number; lon: number } | null = null;
 	let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -65,6 +72,10 @@
 		const cost = SIZE_COST[selectedSize];
 		if (remaining < cost) {
 			showToast(`Not enough volume (${cost} cm³ needed)`);
+			return;
+		}
+		if (pose.accuracy !== null && pose.accuracy > 25) {
+			showToast(`GPS too imprecise (±${pose.accuracy.toFixed(0)} m) — hold still, open sky helps`);
 			return;
 		}
 		placing = true;
@@ -104,6 +115,20 @@
 		}
 	}
 
+	async function share(tag: NearbyTag) {
+		const url = `${location.origin}/t/${tag.id}`;
+		try {
+			if (navigator.share) {
+				await navigator.share({ title: 'ART tag', url });
+			} else {
+				await navigator.clipboard.writeText(url);
+				showToast('Link copied');
+			}
+		} catch {
+			/* user cancelled the share sheet */
+		}
+	}
+
 	async function report(tag: NearbyTag) {
 		try {
 			await reportTag(tag.id);
@@ -125,14 +150,15 @@
 		}
 
 		session = new ArSession(canvas);
-		session.onGps = (fix, distMoved) => {
-			accuracy = fix.accuracy;
+		session.onGps = (fix) => {
+			accuracy = session?.averagedFix()?.accuracy ?? fix.accuracy;
 			if (!hasFix) {
 				hasFix = true;
 				void fetchNearby(fix.lat, fix.lon);
+				void loadFocusTag(fix.lat, fix.lon);
 			} else if (
 				lastFetchAt &&
-				(distMoved > REFETCH_DISTANCE_M || Math.abs(fix.lat - lastFetchAt.lat) > 0.0005)
+				distanceM(fix.lat, fix.lon, lastFetchAt.lat, lastFetchAt.lon) > REFETCH_DISTANCE_M
 			) {
 				void fetchNearby(fix.lat, fix.lon);
 			}
@@ -158,10 +184,40 @@
 			const fix = session?.lastFix;
 			if (fix) void fetchNearby(fix.lat, fix.lon);
 		}, REFETCH_INTERVAL_MS);
+
+		// Guidance arrow: bearing to the focused tag relative to camera heading.
+		arrowTimer = setInterval(() => {
+			const fix = session?.lastFix;
+			if (!focusTag || !fix) return;
+			focusDistance = distanceM(fix.lat, fix.lon, focusTag.lat, focusTag.lon);
+			const heading = session?.heading();
+			if (heading !== null && heading !== undefined) {
+				arrowRotation = (bearingDeg(fix.lat, fix.lon, focusTag.lat, focusTag.lon) - heading + 360) % 360;
+			}
+		}, 250);
 	});
+
+	async function loadFocusTag(lat: number, lon: number) {
+		const id = page.url.searchParams.get('t');
+		if (!id) return;
+		try {
+			const tag = await getTag(id);
+			if (!tag) {
+				showToast('Tag not found (removed?)');
+				return;
+			}
+			tag.distance_m = distanceM(lat, lon, tag.lat, tag.lon);
+			focusTag = tag;
+			if (!tags.some((t) => t.id === tag.id)) tags = [...tags, tag];
+			session?.addTag(tag);
+		} catch (e) {
+			console.error('focus tag load failed', e);
+		}
+	}
 
 	onDestroy(() => {
 		clearInterval(pollTimer);
+		clearInterval(arrowTimer);
 		clearTimeout(toastTimer);
 		session?.dispose();
 		session = null;
@@ -187,6 +243,13 @@
 		<div class="center-note error">
 			<p>{errorMsg}</p>
 			<button class="chip" onclick={() => location.reload()}>Retry</button>
+		</div>
+	{/if}
+
+	{#if phase === 'ready' && focusTag && focusDistance !== null && focusDistance > 15}
+		<div class="guide">
+			<span class="guide-arrow" style="transform: rotate({arrowRotation - 90}deg)">➤</span>
+			<span>{focusDistance < 1000 ? `${focusDistance.toFixed(0)} m` : `${(focusDistance / 1000).toFixed(1)} km`} to tag</span>
 		</div>
 	{/if}
 
@@ -243,6 +306,7 @@
 						👍 Appraise (+25 cm³ to creator)
 					</button>
 				{/if}
+				<button class="chip" onclick={() => selectedTag && share(selectedTag)}>share</button>
 				<button class="chip" onclick={() => selectedTag && report(selectedTag)}>report</button>
 			</div>
 		</div>
@@ -399,6 +463,28 @@
 		color: white;
 		font-weight: 700;
 		padding: 0.7rem;
+	}
+	.guide {
+		position: absolute;
+		top: calc(env(safe-area-inset-top) + 4.5rem);
+		left: 50%;
+		transform: translateX(-50%);
+		display: flex;
+		gap: 0.6rem;
+		align-items: center;
+		background: rgba(11, 11, 15, 0.8);
+		border: 1px solid rgba(255, 255, 255, 0.15);
+		border-radius: 999px;
+		padding: 0.5rem 1rem;
+		z-index: 15;
+		backdrop-filter: blur(8px);
+		font-size: 0.9rem;
+	}
+	.guide-arrow {
+		display: inline-block;
+		color: var(--accent-2);
+		font-size: 1.2rem;
+		transition: transform 0.25s linear;
 	}
 	.toast {
 		position: absolute;
