@@ -10,12 +10,13 @@
 	import { triangulate, avgLuminance, type Feature } from '$lib/mesh';
 	import { sampleFrame, burstSample, encodeSample, type FrameSample } from '$lib/wallmap';
 
-	import { fmtVolume, type Profile, type Spot } from '$lib/types';
+	import { fmtVolume, fmtArt, toArt, USD_PER_ART, type Profile, type Spot } from '$lib/types';
 
 	type Thickness = 'thin' | 'medium' | 'thick';
 	const CAULK_RADIUS: Record<Thickness, number> = { thin: 0.015, medium: 0.03, thick: 0.05 };
 	const VOX_SIZE: Record<Thickness, number> = { thin: 0.012, medium: 0.024, thick: 0.04 };
 	const LOCK_TIMEOUT_MS = 7000;
+	const DEPTH_SEGMENTS = 12;
 
 	let video: HTMLVideoElement;
 	let overlay: HTMLCanvasElement;
@@ -27,7 +28,6 @@
 	let buildPct = $state(0);
 	let remapCount = $state(0);
 	let thickness = $state<Thickness>('medium');
-	let depthCm = $state(3);
 	let errorMsg = $state('');
 	let toast = $state('');
 	let profile = $state<Profile | null>(null);
@@ -57,8 +57,14 @@
 	const raycaster = new THREE.Raycaster();
 	let lockTimer: ReturnType<typeof setTimeout> | undefined;
 
-	// stroke state (anchor space)
+	// Pending bead (anchor space): strokes accumulate, EXTRUDE commits.
 	let brush: VoxelBrush | null = null;
+	let drawing = false;
+	let pendingCells = $state(0);
+	let extrudePct = $state(0);
+	let committing = $state(false);
+	let activeVox = $state(VOX_SIZE.medium);
+	let extrudeTimer: ReturnType<typeof setInterval> | undefined;
 	let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
 	// Precision gate: pose must settle before caulking is allowed. Enter/exit
@@ -79,10 +85,8 @@
 	let meshGroup: THREE.Group | null = null;
 
 	const remaining = $derived(profile ? profile.total_volume - profile.used_volume : 0);
-	const meterPct = $derived(
-		profile && profile.total_volume > 0
-			? Math.max(0, Math.min(100, (remaining / profile.total_volume) * 100))
-			: 0
+	const pendingVolCm3 = $derived(
+		pendingCells ? Math.max(10, Math.round(pendingCells * activeVox ** 3 * 1e6)) : 0
 	);
 
 	function showToast(msg: string) {
@@ -158,10 +162,46 @@
 		}, SCAN_TICK_MS);
 	}
 
+	function makeWallFrame(aspect: number): THREE.Group {
+		const g = new THREE.Group();
+		const hw = 0.5;
+		const hh = Math.max(0.2, aspect / 2);
+		const corners: Array<[number, number]> = [
+			[-hw, -hh],
+			[hw, -hh],
+			[hw, hh],
+			[-hw, hh]
+		];
+		const geo = new THREE.BufferGeometry().setFromPoints(
+			[...corners, corners[0]].map(([x, y]) => new THREE.Vector3(x, y, 0))
+		);
+		const line = new THREE.Line(
+			geo,
+			new THREE.LineDashedMaterial({
+				color: 0x7b61ff,
+				dashSize: 0.03,
+				gapSize: 0.022,
+				transparent: true,
+				opacity: 0.8
+			})
+		);
+		line.computeLineDistances();
+		g.add(line);
+		const dotGeo = new THREE.SphereGeometry(0.011, 10, 8);
+		const dotMat = new THREE.MeshBasicMaterial({ color: 0x8b7bff });
+		for (const [x, y] of corners) {
+			const d = new THREE.Mesh(dotGeo, dotMat);
+			d.position.set(x, y, 0);
+			g.add(d);
+		}
+		return g;
+	}
+
 	/** Best frame → compile the 3D map → boot tracking. Caulk unlocks at lock. */
 	async function buildMap(sourceVideo?: HTMLVideoElement) {
 		try {
 			clearInterval(scanTimer);
+			clearPending();
 			phase = 'building';
 			buildPct = 0;
 			let sample = bestSample;
@@ -237,6 +277,9 @@
 			new THREE.MeshBasicMaterial({ visible: false })
 		);
 		anchorGroup!.add(tapPlane);
+		// Dashed registration frame glued to the mapped wall — the honest 3D
+		// cue: it holds perspective and parallax with the physical surface.
+		anchorGroup!.add(makeWallFrame(detectData ? detectData.height / detectData.width : 0.75));
 
 		anchor.onTargetFound = () => {
 			phase = 'ready';
@@ -321,31 +364,77 @@
 		return anchorGroup.worldToLocal(hits[0].point.clone());
 	}
 
+	function syncPending() {
+		pendingCells = brush?.cells.length ?? 0;
+		extrudePct = brush ? (brush.maxHeight() / brush.maxLayerCount) * 100 : 0;
+	}
+
 	function onDown(ev: PointerEvent) {
-		// Only on a SUPERPRECISE, stabilized 3D plane.
-		if (phase !== 'ready' || !precise || brush) return;
+		// Only on a locked, stabilized 3D plane.
+		if (phase !== 'ready' || !precise || committing) return;
 		const p = wallPoint(ev);
 		if (!p || !anchorGroup) return;
-		brush = new VoxelBrush(VOX_SIZE[thickness], depthCm / 100);
-		anchorGroup.add(brush.group);
-		brush.stampAt(p.x, p.y, CAULK_RADIUS[thickness]);
+		if (!brush) {
+			activeVox = VOX_SIZE[thickness];
+			brush = new VoxelBrush(activeVox, 0, DEPTH_SEGMENTS);
+			anchorGroup.add(brush.group);
+		}
+		drawing = true;
+		brush.stampTo(p.x, p.y, CAULK_RADIUS[thickness]);
+		syncPending();
 	}
 
 	function onMove(ev: PointerEvent) {
-		if (!brush) return;
+		if (!drawing || !brush) return;
 		const p = wallPoint(ev);
 		if (!p) return;
-		brush.stampAt(p.x, p.y, CAULK_RADIUS[thickness]);
+		brush.stampTo(p.x, p.y, CAULK_RADIUS[thickness]);
+		syncPending();
 	}
 
-	async function onUp() {
-		if (!brush) return;
-		const b = brush;
+	function onUp() {
+		drawing = false;
+		brush?.endStroke();
+	}
+
+	function clearPending() {
+		clearInterval(extrudeTimer);
+		brush?.dispose();
 		brush = null;
-		if (b.cells.length < 1) {
-			b.dispose();
+		drawing = false;
+		pendingCells = 0;
+		extrudePct = 0;
+	}
+
+	function extrudeDown(ev: PointerEvent) {
+		ev.stopPropagation();
+		if (!brush || committing) return;
+		(ev.target as HTMLElement)?.setPointerCapture?.(ev.pointerId);
+		clearInterval(extrudeTimer);
+		extrudeTimer = setInterval(() => {
+			if (!brush || !brush.extrude()) {
+				clearInterval(extrudeTimer);
+				return;
+			}
+			syncPending();
+		}, 220);
+	}
+
+	async function extrudeUp() {
+		clearInterval(extrudeTimer);
+		extrudeTimer = undefined;
+		await commit();
+	}
+
+	/** Persist the pending bead; the committed mesh stays on the wall. */
+	async function commit() {
+		if (!brush || committing) return;
+		if (brush.cells.length < 1) {
+			clearPending();
 			return;
 		}
+		const b = brush;
+		committing = true;
 		try {
 			if (!spotPromise) throw new Error('wall not anchored yet');
 			const spot = await spotPromise;
@@ -355,13 +444,16 @@
 				lon: spot.lon,
 				accuracy: gps?.accuracy ?? null,
 				cells: b.cells,
-				vox: VOX_SIZE[thickness],
-				depth: depthCm / 100
+				vox: activeVox,
+				depth: 0
 			});
+			brush = null; // committed bead stays rendered in anchor space
+			pendingCells = 0;
+			extrudePct = 0;
 			if (profile) profile = await getProfile(profile.id);
-			showToast(`−${fmtVolume(placed.volume_cm3)} · ${b.cells.length} voxels`);
+			showToast(`−${fmtVolume(placed.volume_cm3)} · placed`);
 		} catch (e) {
-			b.dispose();
+			clearPending();
 			const msg = errText(e);
 			showToast(
 				msg.includes('insufficient')
@@ -372,6 +464,8 @@
 							? 'Offline — stroke not saved'
 							: msg
 			);
+		} finally {
+			committing = false;
 		}
 	}
 
@@ -482,6 +576,7 @@
 
 	function stopEverything() {
 		clearInterval(scanTimer);
+		clearInterval(extrudeTimer);
 		clearTimeout(lockTimer);
 		clearTimeout(toastTimer);
 		meshRenderer?.setAnimationLoop(null);
@@ -511,27 +606,23 @@
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="hud top" onpointerdown={(e) => e.stopPropagation()}>
 		<button class="chip" onclick={() => goto('/')}>‹</button>
-		<span class="chip status" class:ready={phase === 'ready'}>
-			{#if phase === 'boot'}Starting…
-			{:else if phase === 'aim'}SCANNING WALL · {featureCount} pts
-			{:else if phase === 'building'}BUILDING 3D MAP · {buildPct.toFixed(0)}%{featureCount
-					? ` · ${Math.floor((featureCount * buildPct) / 100)} pts`
-					: ''}
-			{:else if phase === 'locking'}{remapCount > 0 ? 'REMAPPING · ' : ''}LOCKING…
-			{:else if phase === 'ready'}{precise ? 'SUPERPRECISE ✓' : 'STABILIZING…'}{/if}
-		</span>
+		<div class="pill" class:live={phase === 'ready' && precise}>
+			<span class="pill-dot"></span>
+			<span class="pill-lines">
+				{#if phase === 'boot'}<strong>STARTING</strong><small>camera…</small>
+				{:else if phase === 'aim'}<strong>SCANNING WALL</strong><small>{featureCount} pts live</small>
+				{:else if phase === 'building'}<strong>BUILDING 3D MAP</strong><small
+						>{buildPct.toFixed(0)}% · {Math.floor((featureCount * buildPct) / 100)} pts</small>
+				{:else if phase === 'locking'}<strong>{remapCount > 0 ? 'REMAPPING' : 'LOCKING'}</strong><small
+						>hold on the wall</small>
+				{:else if phase === 'ready'}<strong>{precise ? 'WALL LOCKED' : 'STABILIZING'}</strong><small
+						>{precise ? '3D wall live' : 'hold still…'}</small>{/if}
+			</span>
+		</div>
 		{#if spotId}
 			<button class="chip" onclick={share}>share</button>
 		{/if}
 	</div>
-
-	{#if profile && phase !== 'boot' && phase !== 'error'}
-		<div class="meter" aria-hidden="true">
-			<span class="meter-label">VOLUME</span>
-			<div class="meter-bar"><div class="meter-fill" style="height: {meterPct}%"></div></div>
-			<span class="meter-pct">{meterPct.toFixed(0)}%</span>
-		</div>
-	{/if}
 
 	{#if phase === 'aim'}
 		<div class="hud bottom">
@@ -544,13 +635,30 @@
 	{/if}
 
 	{#if phase === 'ready' || phase === 'locking'}
+		<div class="depth-meter" aria-hidden="true">
+			<span class="dm-label">DEPTH</span>
+			<div class="dm-track">
+				{#each Array(DEPTH_SEGMENTS) as _, i (i)}
+					<span
+						class="dm-seg"
+						class:on={extrudePct >= ((DEPTH_SEGMENTS - i) / DEPTH_SEGMENTS) * 100 - 0.5}
+					></span>
+				{/each}
+			</div>
+			<span class="dm-pct">{extrudePct.toFixed(0)}%</span>
+		</div>
+
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<div class="hud bottom" onpointerdown={(e) => e.stopPropagation()}>
-			<label class="depth">
-				<span class="depth-label">DEPTH</span>
-				<input type="range" min="-5" max="15" step="1" bind:value={depthCm} />
-				<span class="depth-val">{depthCm} cm</span>
-			</label>
+			{#if phase !== 'ready' || !precise}
+				<p class="tip">
+					{phase !== 'ready'
+						? 'Hold the camera on the wall you mapped…'
+						: 'Hold still — locking the wall…'}
+				</p>
+			{:else if !pendingCells}
+				<p class="tip">Draw on the wall, then hold EXTRUDE</p>
+			{/if}
 			<div class="thickness">
 				{#each ['thin', 'medium', 'thick'] as const as t}
 					<button class="thick-btn" class:active={thickness === t} onclick={() => (thickness = t)}>
@@ -559,14 +667,36 @@
 					</button>
 				{/each}
 			</div>
-			<p class="tip">
-				{phase !== 'ready'
-					? 'Hold the camera on the wall you mapped…'
-					: precise
-						? 'Build on the wall — layer over layer'
-						: 'Hold still — stabilizing the plane…'}
-			</p>
+			<div class="board">
+				<div class="stat">
+					<span class="stat-label">VOLUME COST</span>
+					<strong class="stat-big">{(toArt(pendingVolCm3) * 100).toFixed(0)}%</strong>
+					<small>~{toArt(pendingVolCm3).toFixed(2)} ART</small>
+				</div>
+				<div class="stat">
+					<span class="stat-label">BALANCE</span>
+					<strong class="stat-big">{fmtArt(remaining)} ART</strong>
+					<small>≈ ${(toArt(remaining) * USD_PER_ART).toFixed(2)}</small>
+				</div>
+				<button
+					class="extrude"
+					disabled={!pendingCells || committing}
+					onpointerdown={extrudeDown}
+					onpointerup={extrudeUp}
+					onpointercancel={extrudeUp}
+				>
+					{committing ? 'SAVING…' : 'EXTRUDE'}
+					<small>{pendingCells ? 'HOLD TO EXTRUDE' : 'DRAW FIRST'}</small>
+				</button>
+			</div>
 		</div>
+		{#if pendingCells && !committing}
+			<button
+				class="undo"
+				onpointerdown={(e) => e.stopPropagation()}
+				onclick={clearPending}
+				aria-label="discard pending bead">✕</button>
+		{/if}
 	{/if}
 
 	{#if phase === 'error'}
@@ -629,20 +759,55 @@
 		font-size: 0.85rem;
 		backdrop-filter: blur(8px);
 	}
-	.chip.status {
+	/* Status pill: live dot + two lines, like the mock's VPS LOCKED chip */
+	.pill {
 		flex: 1;
-		text-align: center;
-		letter-spacing: 0.04em;
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		justify-content: center;
+		background: rgba(10, 10, 14, 0.82);
+		border: 1px solid rgba(255, 255, 255, 0.1);
+		border-radius: 999px;
+		padding: 0.45rem 1rem;
+		backdrop-filter: blur(10px);
 	}
-	.chip.status.ready {
-		color: #4ade80;
-		border-color: rgba(74, 222, 128, 0.5);
+	.pill-dot {
+		width: 0.65rem;
+		height: 0.65rem;
+		border-radius: 999px;
+		background: var(--accent);
+		box-shadow: 0 0 10px var(--accent);
+		flex-shrink: 0;
 	}
-	.meter {
+	.pill.live .pill-dot {
+		background: #4ade80;
+		box-shadow: 0 0 10px #4ade80;
+	}
+	.pill-lines {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		line-height: 1.15;
+	}
+	.pill-lines strong {
+		font-size: 0.82rem;
+		letter-spacing: 0.06em;
+		color: var(--accent-2, #a78bfa);
+	}
+	.pill.live .pill-lines strong {
+		color: #e9e6ff;
+	}
+	.pill-lines small {
+		font-size: 0.68rem;
+		color: var(--muted);
+	}
+
+	/* Segmented DEPTH meter (fills while holding EXTRUDE) */
+	.depth-meter {
 		position: absolute;
 		left: 0.9rem;
-		top: 50%;
-		transform: translateY(-38%);
+		bottom: calc(env(safe-area-inset-bottom) + 13.5rem);
 		display: flex;
 		flex-direction: column;
 		align-items: center;
@@ -650,56 +815,118 @@
 		z-index: 8;
 		pointer-events: none;
 	}
-	.meter-label {
+	.dm-label {
 		font-size: 0.6rem;
-		letter-spacing: 0.12em;
+		letter-spacing: 0.14em;
 		color: var(--text);
 		text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
 	}
-	.meter-bar {
-		width: 0.85rem;
-		height: 7.5rem;
-		border-radius: 999px;
-		background: rgba(11, 11, 15, 0.55);
-		border: 1px solid rgba(255, 255, 255, 0.25);
-		overflow: hidden;
+	.dm-track {
 		display: flex;
-		align-items: flex-end;
+		flex-direction: column;
+		gap: 0.22rem;
+		background: rgba(10, 10, 14, 0.75);
+		border: 1px solid rgba(255, 255, 255, 0.1);
+		border-radius: 999px;
+		padding: 0.45rem 0.35rem;
 	}
-	.meter-fill {
-		width: 100%;
-		background: linear-gradient(180deg, var(--accent-2), var(--accent));
-		transition: height 0.3s ease;
+	.dm-seg {
+		width: 0.95rem;
+		height: 0.42rem;
+		border-radius: 999px;
+		background: rgba(255, 255, 255, 0.14);
 	}
-	.meter-pct {
+	.dm-seg.on {
+		background: var(--accent);
+		box-shadow: 0 0 6px rgba(123, 97, 255, 0.7);
+	}
+	.dm-pct {
 		font-size: 0.75rem;
 		font-weight: 700;
-		color: var(--text);
+		color: var(--accent-2, #a78bfa);
 		text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
 	}
-	.depth {
+
+	/* Bottom board: VOLUME COST | BALANCE | EXTRUDE */
+	.board {
 		display: flex;
-		align-items: center;
-		gap: 0.6rem;
-		background: rgba(11, 11, 15, 0.7);
-		border-radius: 999px;
-		padding: 0.35rem 0.9rem;
+		align-items: stretch;
+		gap: 0.9rem;
+		background: rgba(10, 10, 14, 0.85);
+		border: 1px solid rgba(255, 255, 255, 0.08);
+		border-radius: 1.4rem;
+		padding: 0.9rem 1.1rem;
+		backdrop-filter: blur(12px);
 	}
-	.depth-label {
-		font-size: 0.6rem;
-		letter-spacing: 0.1em;
+	.stat {
+		display: flex;
+		flex-direction: column;
+		gap: 0.15rem;
+		justify-content: center;
+		min-width: 0;
+	}
+	.stat + .stat {
+		border-left: 1px solid rgba(255, 255, 255, 0.12);
+		padding-left: 0.9rem;
+	}
+	.stat-label {
+		font-size: 0.58rem;
+		letter-spacing: 0.12em;
 		color: var(--muted);
+		white-space: nowrap;
 	}
-	.depth input {
+	.stat-big {
+		font-size: 1.25rem;
+		font-weight: 800;
+		color: var(--accent-2, #a78bfa);
+		white-space: nowrap;
+	}
+	.stat small {
+		font-size: 0.7rem;
+		color: var(--muted);
+		white-space: nowrap;
+	}
+	.extrude {
 		flex: 1;
-		accent-color: var(--accent);
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 0.15rem;
+		border: none;
+		border-radius: 1.1rem;
+		background: linear-gradient(135deg, #6d5ef6, #8b7bff);
+		color: #fff;
+		font-weight: 800;
+		font-size: 1.05rem;
+		letter-spacing: 0.05em;
+		padding: 0.8rem 1rem;
+		touch-action: none;
 	}
-	.depth-val {
-		font-size: 0.78rem;
-		font-weight: 700;
-		min-width: 3.2rem;
-		text-align: right;
+	.extrude small {
+		font-size: 0.6rem;
+		font-weight: 600;
+		letter-spacing: 0.1em;
+		opacity: 0.8;
 	}
+	.extrude:disabled {
+		opacity: 0.45;
+	}
+	.undo {
+		position: absolute;
+		bottom: calc(env(safe-area-inset-bottom) + 12.2rem);
+		left: 50%;
+		transform: translateX(-50%);
+		width: 2.6rem;
+		height: 2.6rem;
+		border-radius: 999px;
+		background: rgba(10, 10, 14, 0.85);
+		border: 1.5px solid var(--accent);
+		color: var(--text);
+		font-size: 1rem;
+		z-index: 11;
+	}
+
 	.thickness {
 		display: flex;
 		gap: 0.5rem;
