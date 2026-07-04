@@ -91,6 +91,8 @@
 			<li>SPRAY finds the nearest tagged wall with GPS — or turns the wall in front of you into one, automatically.</li>
 			<li>Hold &amp; drag on a locked wall to spray caulk; tap a tag to appraise it.</li>
 		</ul>
+
+		<p class="build">build {__BUILD_TS__}</p>
 	{/if}
 </main>
 
@@ -212,6 +214,12 @@
 		display: flex;
 		flex-direction: column;
 		gap: 0.4rem;
+	}
+	.build {
+		color: var(--muted);
+		font-size: 0.7rem;
+		opacity: 0.6;
+		margin: 0;
 	}
 	code {
 		background: #26262f;
