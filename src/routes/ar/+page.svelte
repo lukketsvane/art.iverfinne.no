@@ -7,7 +7,7 @@
 	import type { Spot } from '$lib/types';
 	import { ArSession, offsetLatLon, distanceM, bearingDeg } from '$lib/ar/session';
 	import { LIBRARY } from '$lib/library';
-	import { SIZE_COST, type NearbyTag, type Profile, type SizeClass } from '$lib/types';
+	import { SIZE_COST, fmtVolume, type NearbyTag, type Profile, type SizeClass } from '$lib/types';
 
 	const FETCH_RADIUS_M = 150;
 	const REFETCH_DISTANCE_M = 20;
@@ -239,7 +239,7 @@
 	<div class="hud top">
 		<button class="chip" onclick={() => goto('/')}>‹ back</button>
 		{#if profile}
-			<span class="chip">{remaining.toFixed(0)} cm³</span>
+			<span class="chip">{fmtVolume(remaining)}</span>
 		{/if}
 		<span class="chip" class:warn={!hasFix}>
 			{#if !hasFix}locating…{:else}±{accuracy?.toFixed(0)} m · {tags.length} tags{/if}

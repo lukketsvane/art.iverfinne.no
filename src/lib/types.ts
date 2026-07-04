@@ -60,6 +60,11 @@ export interface SpotTag {
 /** Tag size on a wall, in units of target-image width. */
 export const SPOT_SIZE_SCALE: Record<SizeClass, number> = { s: 0.15, m: 0.28, l: 0.5 };
 
+/** 412 cm³ → "412 cm³"; 998600 cm³ → "999 L". */
+export function fmtVolume(cm3: number): string {
+	return cm3 >= 10000 ? `${(cm3 / 1000).toFixed(0)} L` : `${cm3.toFixed(0)} cm³`;
+}
+
 export interface PlacementPose {
 	lat: number;
 	lon: number;

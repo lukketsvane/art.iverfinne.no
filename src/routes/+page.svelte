@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { ensureSession, isConfigured } from '$lib/supabase';
 	import { getProfile, myStats } from '$lib/api';
-	import type { Profile } from '$lib/types';
+	import { fmtVolume, type Profile } from '$lib/types';
 
 	let profile = $state<Profile | null>(null);
 	let stats = $state<{ places: number; given: number; received: number } | null>(null);
@@ -62,9 +62,9 @@
 			<div class="can-stats">
 				<h2>Your spray can</h2>
 				{#if profile}
-					<p class="big">{remaining.toFixed(0)} <span class="unit">cm³ left</span></p>
+					<p class="big">{fmtVolume(remaining)} <span class="unit">left</span></p>
 					<p class="hint">
-						{profile.used_volume.toFixed(0)} of {profile.total_volume.toFixed(0)} cm³ used ·
+						{fmtVolume(profile.used_volume)} of {fmtVolume(profile.total_volume)} used ·
 						appraisals from others grow your can (+25 cm³ each)
 					</p>
 				{:else}
