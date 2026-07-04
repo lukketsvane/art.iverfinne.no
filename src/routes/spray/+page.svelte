@@ -7,6 +7,7 @@
 	import { nearbySpots, createSpot, placeVoxels, getProfile, errText } from '$lib/api';
 	import { VoxelBrush } from '$lib/voxel';
 	import { compileWallTarget, uploadSpotAssets, collectAveragedFix, downscaleJpeg } from '$lib/spots';
+	import { detectFeatures, triangulate } from '$lib/mesh';
 
 	import { fmtVolume, type Profile, type Spot } from '$lib/types';
 
@@ -34,6 +35,8 @@
 	let frame: Blob | null = null; // 1280px reference photo
 	let frameW = 0;
 	let frameH = 0;
+	let detectData: ImageData | null = null; // small copy for feature detection
+	let featureCount = $state(0);
 
 	// The wall's DB row is created in the background; strokes await it.
 	let spotPromise: Promise<Spot> | null = null;
@@ -128,6 +131,14 @@
 		canvas.getContext('2d')!.drawImage(src, 0, 0, canvas.width, canvas.height);
 		frameW = canvas.width;
 		frameH = canvas.height;
+		// Small grayscale-ready copy for the real feature-detection overlay
+		const dScale = 420 / Math.max(canvas.width, canvas.height);
+		const dc = document.createElement('canvas');
+		dc.width = Math.max(2, Math.round(canvas.width * dScale));
+		dc.height = Math.max(2, Math.round(canvas.height * dScale));
+		const dctx = dc.getContext('2d', { willReadFrequently: true })!;
+		dctx.drawImage(canvas, 0, 0, dc.width, dc.height);
+		detectData = dctx.getImageData(0, 0, dc.width, dc.height);
 		return await new Promise((resolve, reject) =>
 			canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('capture failed'))), 'image/jpeg', 0.85)
 		);
@@ -340,12 +351,7 @@
 		}
 	}
 
-	// ---- map-building wireframe (drawn on top of the live feed) --------------
-
-	function rnd(k: number): number {
-		const x = Math.sin(k * 12.9898) * 43758.5453;
-		return x - Math.floor(x);
-	}
+	// ---- map-building mesh: REAL detected wall features, drawn over the feed --
 
 	function showMesh() {
 		if (!meshRenderer) {
@@ -364,30 +370,31 @@
 		}
 		overlay.style.display = 'block';
 		hideMesh();
-		meshGroup = new THREE.Group();
+		if (!detectData) return;
+
+		// Real Shi-Tomasi corners on the captured wall frame, Delaunay-meshed.
+		const feats = detectFeatures(detectData, 300);
+		featureCount = feats.length;
+		const edges = triangulate(feats);
+		// Points reveal strongest-first; an edge appears once both ends exist.
+		edges.sort((a, b) => Math.max(a[0], a[1]) - Math.max(b[0], b[1]));
+
+		// Map detection-image px → screen px with the video's object-fit: cover
 		const w = window.innerWidth;
 		const h = window.innerHeight;
-		const cols = 13;
-		const rows = 21;
-		const jit = (i: number, j: number, k: number) =>
-			(rnd(i * 37.1 + j * 17.7 + k * 5.3) - 0.5) * (w / cols) * 0.4;
-		const vx = (i: number, j: number): [number, number] => [
-			-w / 2 + (i * w) / cols + jit(i, j, 1),
-			h / 2 - (j * h) / rows + jit(i, j, 2)
-		];
+		const s = Math.max(w / detectData.width, h / detectData.height);
+		const offX = (w - detectData.width * s) / 2;
+		const offY = (h - detectData.height * s) / 2;
+		const ox = (f: { x: number; y: number }) => offX + f.x * s - w / 2;
+		const oy = (f: { x: number; y: number }) => h / 2 - (offY + f.y * s);
+
+		meshGroup = new THREE.Group();
 		const pos: number[] = [];
-		for (let j = 0; j <= rows; j++)
-			for (let i = 0; i < cols; i++) {
-				const a = vx(i, j);
-				const b = vx(i + 1, j);
-				pos.push(a[0], a[1], 1, b[0], b[1], 1);
-			}
-		for (let i = 0; i <= cols; i++)
-			for (let j = 0; j < rows; j++) {
-				const a = vx(i, j);
-				const b = vx(i, j + 1);
-				pos.push(a[0], a[1], 1, b[0], b[1], 1);
-			}
+		const edgeMaxRank: number[] = [];
+		for (const [a, b] of edges) {
+			pos.push(ox(feats[a]), oy(feats[a]), 1, ox(feats[b]), oy(feats[b]), 1);
+			edgeMaxRank.push(Math.max(a, b));
+		}
 		const lgeo = new THREE.BufferGeometry();
 		lgeo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
 		const lines = new THREE.LineSegments(
@@ -396,9 +403,7 @@
 		);
 		meshGroup.add(lines);
 		const ppos: number[] = [];
-		const pointCount = 260;
-		for (let k = 0; k < pointCount; k++)
-			ppos.push((rnd(k + 1) - 0.5) * w, (rnd(k * 3 + 2) - 0.5) * h, 2);
+		for (const f of feats) ppos.push(ox(f), oy(f), 2);
 		const pgeo = new THREE.BufferGeometry();
 		pgeo.setAttribute('position', new THREE.Float32BufferAttribute(ppos, 3));
 		const pts = new THREE.Points(
@@ -406,21 +411,24 @@
 			new THREE.PointsMaterial({ color: 0xffffff, size: 3.5, transparent: true, opacity: 0.9 })
 		);
 		meshGroup.add(pts);
-		meshGroup.userData = { lines, pts, lineVerts: pos.length / 3, pointCount };
+		meshGroup.userData = { lines, pts, pointCount: feats.length, edgeMaxRank };
 		meshScene!.add(meshGroup);
 		updateMesh(0);
 	}
 
 	function updateMesh(pct: number) {
 		if (!meshGroup) return;
-		const { lines, pts, lineVerts, pointCount } = meshGroup.userData as {
+		const { lines, pts, pointCount, edgeMaxRank } = meshGroup.userData as {
 			lines: THREE.LineSegments;
 			pts: THREE.Points;
-			lineVerts: number;
 			pointCount: number;
+			edgeMaxRank: number[];
 		};
-		lines.geometry.setDrawRange(0, Math.floor((lineVerts * pct) / 100 / 2) * 2);
-		pts.geometry.setDrawRange(0, Math.floor((pointCount * pct) / 100));
+		const shown = Math.floor((pointCount * pct) / 100);
+		pts.geometry.setDrawRange(0, shown);
+		let edgeCount = 0;
+		while (edgeCount < edgeMaxRank.length && edgeMaxRank[edgeCount] < shown) edgeCount++;
+		lines.geometry.setDrawRange(0, edgeCount * 2);
 	}
 
 	function hideMesh() {
@@ -461,7 +469,9 @@
 		<span class="chip status" class:ready={phase === 'ready'}>
 			{#if phase === 'boot'}Starting…
 			{:else if phase === 'aim'}MAPPING WALL…
-			{:else if phase === 'building'}BUILDING 3D MAP · {buildPct.toFixed(0)}%
+			{:else if phase === 'building'}BUILDING 3D MAP · {buildPct.toFixed(0)}%{featureCount
+					? ` · ${Math.floor((featureCount * buildPct) / 100)} pts`
+					: ''}
 			{:else if phase === 'locking'}{remapCount > 0 ? 'REMAPPING · ' : ''}LOCKING…
 			{:else if phase === 'ready'}{precise ? 'SUPERPRECISE ✓' : 'STABILIZING…'}{/if}
 		</span>
