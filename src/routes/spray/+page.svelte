@@ -6,61 +6,367 @@
 	import { ensureSession } from '$lib/supabase';
 	import { nearbySpots, createSpot, placeCaulk, getProfile } from '$lib/api';
 	import { compileWallTarget, uploadSpotAssets, collectAveragedFix, downscaleJpeg } from '$lib/spots';
-	import { caulkMaterial, caulkJitter, buildCaulk } from '$lib/library';
-	import { fmtVolume, type Profile } from '$lib/types';
+	import { caulkMaterial, buildCaulk } from '$lib/library';
+	import { fmtVolume, type Profile, type Spot } from '$lib/types';
 
 	type Thickness = 'thin' | 'medium' | 'thick';
 	const CAULK_RADIUS: Record<Thickness, number> = { thin: 0.015, medium: 0.03, thick: 0.05 };
+	const LOCK_TIMEOUT_MS = 7000;
 
 	let video: HTMLVideoElement;
 	let overlay: HTMLCanvasElement;
+	let container: HTMLDivElement;
 	let stream: MediaStream | null = null;
 
-	let phase = $state<'boot' | 'live' | 'drawing' | 'error'>('boot');
-	let bg = $state<{ label: string; pct: number } | null>(null);
-	let savedSpotId = $state<string | null>(null);
+	// boot → aim (auto-capture) → building (compile+mesh) → locking → ready
+	let phase = $state<'boot' | 'aim' | 'building' | 'locking' | 'ready' | 'error'>('boot');
+	let buildPct = $state(0);
+	let remapCount = $state(0);
 	let thickness = $state<Thickness>('medium');
-	let depthCm = $state(3); // stand-off from the wall, in image-percent 'cm'
+	let depthCm = $state(3);
 	let errorMsg = $state('');
-	let strokeCount = $state(0);
-	let pendingCost = $state(0);
+	let toast = $state('');
 	let profile = $state<Profile | null>(null);
-	let holding = $state(false);
 	let gps = $state<{ lat: number; lon: number; accuracy: number } | null>(null);
-	let holdTimer: ReturnType<typeof setTimeout> | undefined;
+
+	let frame: Blob | null = null; // 1280px reference photo
+	let frameW = 0;
+	let frameH = 0;
+
+	// The wall's DB row is created in the background; strokes await it.
+	let spotPromise: Promise<Spot> | null = null;
+	let spotId = $state<string | null>(null);
+
+	// MindAR (true 3D: strokes live in the tracked anchor's space)
+	let mindar: any = null;
+	let anchorGroup: THREE.Group | null = null;
+	let tapPlane: THREE.Mesh | null = null;
+	const raycaster = new THREE.Raycaster();
+	let lockTimer: ReturnType<typeof setTimeout> | undefined;
+
+	// stroke state (anchor space)
+	let stroke: Array<[number, number]> | null = null;
+	let strokePreview: THREE.Group | null = null;
+	let toastTimer: ReturnType<typeof setTimeout> | undefined;
+
+	// overlay renderer: ONLY for the map-building wireframe on top of the feed
+	let meshRenderer: THREE.WebGLRenderer | null = null;
+	let meshScene: THREE.Scene | null = null;
+	let meshCamera: THREE.OrthographicCamera | null = null;
+	let meshGroup: THREE.Group | null = null;
 
 	const remaining = $derived(profile ? profile.total_volume - profile.used_volume : 0);
 	const meterPct = $derived(
 		profile && profile.total_volume > 0
-			? Math.max(0, Math.min(100, ((remaining - pendingCost) / profile.total_volume) * 100))
+			? Math.max(0, Math.min(100, (remaining / profile.total_volume) * 100))
 			: 0
 	);
-	const costPct = $derived(remaining > 0 ? Math.min(100, (pendingCost / remaining) * 100) : 0);
 
-	// Frozen-frame drawing state
-	let frame: Blob | null = null;
-	let frameW = 0;
-	let frameH = 0;
-	let strokes: Array<{ points: Array<[number, number]>; r: number; z: number }> = [];
-	let current: Array<[number, number]> | null = null;
+	function showToast(msg: string) {
+		toast = msg;
+		clearTimeout(toastTimer);
+		toastTimer = setTimeout(() => (toast = ''), 2600);
+	}
 
-	// three.js screen-space overlay (glossy caulk look without tracking)
-	let renderer: THREE.WebGLRenderer | null = null;
-	let scene: THREE.Scene | null = null;
-	let camera: THREE.OrthographicCamera | null = null;
-	let strokeGroups: THREE.Group[] = [];
-	let currentGroup: THREE.Group | null = null;
-	let blobIndex = 0;
-	let meshGroup: THREE.Group | null = null;
+	onMount(async () => {
+		try {
+			const userId = await ensureSession();
+			void getProfile(userId).then((p) => (profile = p));
+			const forceNew = Boolean(page.url.searchParams.get('new'));
+			const gpsPromise = collectAveragedFix(3).then((f) => (gps = f ?? gps));
+
+			stream = await navigator.mediaDevices.getUserMedia({
+				video: { facingMode: 'environment', width: { ideal: 1920 } }
+			});
+			video.srcObject = stream;
+			await video.play();
+			phase = 'aim';
+
+			if (!forceNew) {
+				void gpsPromise.then(async () => {
+					if (!gps || phase !== 'aim') return;
+					try {
+						const spots = await nearbySpots(gps.lat, gps.lon, 500);
+						if (spots.length > 0 && phase === 'aim') {
+							stopEverything();
+							void goto(`/spots/${spots[0].id}`, { replaceState: true });
+						}
+					} catch {
+						/* offline lookup — keep mapping locally */
+					}
+				});
+			}
+
+			// Automatic: a beat to aim/expose, then the wall is captured and mapped.
+			setTimeout(() => {
+				if (phase === 'aim') void buildMap();
+			}, 1300);
+		} catch (e) {
+			phase = 'error';
+			const err = e as { name?: string };
+			errorMsg =
+				err?.name === 'NotAllowedError'
+					? 'Camera access denied — allow it in Settings and reload.'
+					: e instanceof Error
+						? e.message
+						: String(e);
+		}
+	});
+
+	async function captureFrame(src: HTMLVideoElement): Promise<Blob> {
+		const maxEdge = 1280;
+		const scale = Math.min(1, maxEdge / Math.max(src.videoWidth, src.videoHeight));
+		const canvas = document.createElement('canvas');
+		canvas.width = Math.round(src.videoWidth * scale);
+		canvas.height = Math.round(src.videoHeight * scale);
+		canvas.getContext('2d')!.drawImage(src, 0, 0, canvas.width, canvas.height);
+		frameW = canvas.width;
+		frameH = canvas.height;
+		return await new Promise((resolve, reject) =>
+			canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('capture failed'))), 'image/jpeg', 0.85)
+		);
+	}
+
+	/** Capture → compile the 3D map → boot tracking. Caulk unlocks at lock. */
+	async function buildMap(sourceVideo?: HTMLVideoElement) {
+		try {
+			phase = 'building';
+			buildPct = 0;
+			frame = await captureFrame(sourceVideo ?? video);
+			const compileInput = await downscaleJpeg(frame, 800);
+			showMesh();
+			const target = await compileWallTarget(compileInput, (p) => {
+				buildPct = p;
+				updateMesh(p);
+			});
+			hideMesh();
+
+			// Wall row + assets persist in the background; strokes await spotPromise.
+			if (!spotPromise) {
+				const photo = frame;
+				spotPromise = (async () => {
+					gps = (await collectAveragedFix(1)) ?? gps;
+					const { imagePath, targetPath } = await uploadSpotAssets(photo!, target);
+					const spot = await createSpot({
+						lat: gps?.lat ?? 0,
+						lon: gps?.lon ?? 0,
+						accuracy: gps?.accuracy ?? null,
+						name: null,
+						imagePath,
+						targetPath
+					});
+					spotId = spot.id;
+					return spot;
+				})();
+				spotPromise.catch(() => (spotPromise = null));
+			}
+
+			await bootTracking(URL.createObjectURL(target));
+		} catch (e) {
+			phase = 'error';
+			errorMsg = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	async function bootTracking(targetUrl: string) {
+		// Raw preview camera off — MindAR takes over with the fresh map.
+		stream?.getTracks().forEach((t) => t.stop());
+		stream = null;
+		video.style.display = 'none';
+		overlay.style.display = 'none';
+		disposeMindar();
+
+		const { MindARThree } = await import('$lib/vendor/mindar/mindar-image-three.prod.js');
+		mindar = new MindARThree({
+			container,
+			imageTargetSrc: targetUrl,
+			uiLoading: 'no',
+			uiScanning: 'no',
+			uiError: 'no',
+			filterMinCF: 0.0001,
+			filterBeta: 0.001
+		});
+		mindar.scene.add(new THREE.HemisphereLight(0xffffff, 0x334155, 2.4));
+		const anchor = mindar.addAnchor(0);
+		anchorGroup = anchor.group;
+		tapPlane = new THREE.Mesh(
+			new THREE.PlaneGeometry(5, 5),
+			new THREE.MeshBasicMaterial({ visible: false })
+		);
+		anchorGroup!.add(tapPlane);
+
+		anchor.onTargetFound = () => {
+			phase = 'ready';
+			clearTimeout(lockTimer);
+		};
+		anchor.onTargetLost = () => {
+			if (phase === 'ready') phase = 'locking';
+			armLockTimer();
+		};
+
+		await mindar.start();
+		phase = 'locking';
+		armLockTimer();
+		mindar.renderer.setAnimationLoop(() => {
+			mindar.renderer.render(mindar.scene, mindar.camera);
+		});
+	}
+
+	/** Map didn't lock in time → remap from what the camera sees NOW. */
+	function armLockTimer() {
+		clearTimeout(lockTimer);
+		lockTimer = setTimeout(() => {
+			if (phase !== 'locking') return;
+			const mv = container.querySelector('video:not([style*="display: none"])') as
+				| HTMLVideoElement
+				| null;
+			if (!mv || remapCount >= 4) return;
+			remapCount += 1;
+			spotPromise = null; // previous map never locked; replace the wall row
+			spotId = null;
+			void buildMap(mv);
+		}, LOCK_TIMEOUT_MS);
+	}
+
+	function disposeMindar() {
+		try {
+			clearTimeout(lockTimer);
+			mindar?.renderer?.setAnimationLoop(null);
+			mindar?.stop();
+			for (const v of Array.from(container?.querySelectorAll('video') ?? [])) {
+				if (v === video) continue;
+				const st = (v as HTMLVideoElement).srcObject as MediaStream | null;
+				st?.getTracks().forEach((t) => t.stop());
+				v.remove();
+			}
+			mindar?.renderer?.domElement?.remove();
+		} catch {
+			/* teardown must never throw */
+		}
+		mindar = null;
+		anchorGroup = null;
+		tapPlane = null;
+	}
+
+	// ---- Caulk in TRUE 3D: raycast onto the tracked wall plane ---------------
+
+	function wallPoint(ev: PointerEvent): THREE.Vector3 | null {
+		if (!mindar || !anchorGroup || !tapPlane) return null;
+		const el = mindar.renderer.domElement as HTMLCanvasElement;
+		const r = el.getBoundingClientRect();
+		const ndc = new THREE.Vector2(
+			((ev.clientX - r.left) / r.width) * 2 - 1,
+			-(((ev.clientY - r.top) / r.height) * 2 - 1)
+		);
+		raycaster.setFromCamera(ndc, mindar.camera);
+		const hits = raycaster.intersectObject(tapPlane, false);
+		if (!hits.length) return null;
+		return anchorGroup.worldToLocal(hits[0].point.clone());
+	}
+
+	function onDown(ev: PointerEvent) {
+		if (phase !== 'ready' || stroke) return;
+		const p = wallPoint(ev);
+		if (!p || !anchorGroup) return;
+		stroke = [[p.x, p.y]];
+		strokePreview = new THREE.Group();
+		anchorGroup.add(strokePreview);
+		addBead(p.x, p.y);
+	}
+
+	function onMove(ev: PointerEvent) {
+		if (!stroke || !strokePreview) return;
+		const p = wallPoint(ev);
+		if (!p) return;
+		const last = stroke[stroke.length - 1];
+		const r = CAULK_RADIUS[thickness];
+		if (Math.hypot(p.x - last[0], p.y - last[1]) < r * 0.6 || stroke.length >= 200) return;
+		stroke.push([p.x, p.y]);
+		addBead(p.x, p.y);
+	}
+
+	function addBead(x: number, y: number) {
+		if (!strokePreview) return;
+		const r = CAULK_RADIUS[thickness];
+		const bead = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 14), caulkMaterial());
+		bead.position.set(x, y, depthCm / 100 + r * 0.2);
+		strokePreview.add(bead);
+	}
+
+	async function onUp() {
+		if (!stroke) return;
+		const points = stroke;
+		const preview = strokePreview;
+		stroke = null;
+		strokePreview = null;
+		if (points.length < 2 || !anchorGroup) {
+			preview?.parent?.remove(preview);
+			return;
+		}
+		const r = CAULK_RADIUS[thickness];
+		const z = depthCm / 100;
+		// Bead preview → smooth tube, in anchor (wall) space.
+		preview?.parent?.remove(preview);
+		const tube = buildCaulk(points, r, z);
+		anchorGroup.add(tube);
+		try {
+			if (!spotPromise) throw new Error('wall not anchored yet');
+			const spot = await spotPromise;
+			const placed = await placeCaulk({
+				spotId: spot.id,
+				lat: spot.lat,
+				lon: spot.lon,
+				accuracy: gps?.accuracy ?? null,
+				points,
+				radius: r,
+				depth: z
+			});
+			if (profile) profile = await getProfile(profile.id);
+			showToast(`−${fmtVolume(placed.volume_cm3)}`);
+		} catch (e) {
+			tube.parent?.remove(tube);
+			const msg = e instanceof Error ? e.message : String(e);
+			showToast(msg.includes('insufficient') ? 'Spray can is empty!' : msg);
+		}
+	}
+
+	async function share() {
+		if (!spotId) return;
+		const url = `${location.origin}/spots/${spotId}`;
+		try {
+			if (navigator.share) await navigator.share({ title: 'ART wall', url });
+			else {
+				await navigator.clipboard.writeText(url);
+				showToast('Link copied');
+			}
+		} catch {
+			/* cancelled */
+		}
+	}
+
+	// ---- map-building wireframe (drawn on top of the live feed) --------------
 
 	function rnd(k: number): number {
 		const x = Math.sin(k * 12.9898) * 43758.5453;
 		return x - Math.floor(x);
 	}
 
-	/** Blueprint mesh: violet wireframe + feature points revealed with progress. */
 	function showMesh() {
-		if (!scene) return;
+		if (!meshRenderer) {
+			meshRenderer = new THREE.WebGLRenderer({ canvas: overlay, alpha: true, antialias: true });
+			meshRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+			meshRenderer.setSize(window.innerWidth, window.innerHeight);
+			meshScene = new THREE.Scene();
+			const w = window.innerWidth;
+			const h = window.innerHeight;
+			meshCamera = new THREE.OrthographicCamera(-w / 2, w / 2, h / 2, -h / 2, 0.1, 100);
+			meshCamera.position.z = 10;
+			meshRenderer.setAnimationLoop(() => {
+				if (meshRenderer && meshScene && meshCamera)
+					meshRenderer.render(meshScene, meshCamera);
+			});
+		}
+		overlay.style.display = 'block';
 		hideMesh();
 		meshGroup = new THREE.Group();
 		const w = window.innerWidth;
@@ -93,7 +399,6 @@
 			new THREE.LineBasicMaterial({ color: 0x7b61ff, transparent: true, opacity: 0.5 })
 		);
 		meshGroup.add(lines);
-
 		const ppos: number[] = [];
 		const pointCount = 260;
 		for (let k = 0; k < pointCount; k++)
@@ -106,7 +411,7 @@
 		);
 		meshGroup.add(pts);
 		meshGroup.userData = { lines, pts, lineVerts: pos.length / 3, pointCount };
-		scene.add(meshGroup);
+		meshScene!.add(meshGroup);
 		updateMesh(0);
 	}
 
@@ -127,308 +432,49 @@
 		meshGroup = null;
 	}
 
-	onMount(async () => {
-		try {
-			const userId = await ensureSession();
-			void getProfile(userId).then((p) => (profile = p));
-			const forceNew = Boolean(page.url.searchParams.get('new'));
-			const gpsPromise = collectAveragedFix(forceNew ? 2 : 3).then((f) => (gps = f ?? gps));
-			const mediaStream = await navigator.mediaDevices.getUserMedia({
-				video: { facingMode: 'environment', width: { ideal: 1920 } }
-			});
-			const fix = forceNew ? null : await gpsPromise.then(() => gps);
-
-			// Auto-access: if a tracked wall is nearby, use it — invisible redirect.
-			// ?new=1 skips this (came here to spray a DIFFERENT wall).
-			if (fix && !forceNew) {
-				try {
-					const spots = await nearbySpots(fix.lat, fix.lon, 500);
-					if (spots.length > 0) {
-						mediaStream.getTracks().forEach((t) => t.stop());
-						await goto(`/spots/${spots[0].id}`, { replaceState: true });
-						return;
-					}
-				} catch {
-					/* nearby lookup down — carry on, drawing still works */
-				}
-			}
-
-			stream = mediaStream;
-			video.srcObject = stream;
-			await video.play();
-			initOverlay();
-			phase = 'live';
-		} catch (e) {
-			phase = 'error';
-			const err = e as { name?: string };
-			errorMsg =
-				err?.name === 'NotAllowedError'
-					? 'Camera access denied — allow it in Settings and reload.'
-					: e instanceof Error
-						? e.message
-						: String(e);
-		}
-	});
-
-	function initOverlay() {
-		renderer = new THREE.WebGLRenderer({ canvas: overlay, alpha: true, antialias: true });
-		renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-		renderer.setSize(window.innerWidth, window.innerHeight);
-		scene = new THREE.Scene();
-		scene.add(new THREE.HemisphereLight(0xffffff, 0x334155, 2.4));
-		const w = window.innerWidth;
-		const h = window.innerHeight;
-		camera = new THREE.OrthographicCamera(-w / 2, w / 2, h / 2, -h / 2, 0.1, 2000);
-		camera.position.z = 500;
-		renderer.setAnimationLoop(() => {
-			if (renderer && scene && camera) renderer.render(scene, camera);
-		});
-	}
-
-	/** object-fit: cover mapping between screen px and camera-frame coords. */
-	function coverMap() {
-		const w = window.innerWidth;
-		const h = window.innerHeight;
-		const scale = Math.max(w / frameW, h / frameH);
-		const dispW = frameW * scale;
-		const dispH = frameH * scale;
-		return { w, h, dispW, dispH, offX: (dispW - w) / 2, offY: (dispH - h) / 2 };
-	}
-
-	/** Screen px → target-image coords (image width = 1, origin centre, y up). */
-	function toImage(px: number, py: number): [number, number] {
-		const m = coverMap();
-		const u = (px + m.offX) / m.dispW;
-		const v = (py + m.offY) / m.dispH;
-		return [u - 0.5, (0.5 - v) * (frameH / frameW)];
-	}
-
-	/** Caulk radius in image units → screen px. */
-	function screenRadius(r: number): number {
-		return r * coverMap().dispW;
-	}
-
-	async function captureFrame(): Promise<void> {
-		const maxEdge = 1280;
-		const scale = Math.min(1, maxEdge / Math.max(video.videoWidth, video.videoHeight));
-		const canvas = document.createElement('canvas');
-		canvas.width = Math.round(video.videoWidth * scale);
-		canvas.height = Math.round(video.videoHeight * scale);
-		canvas.getContext('2d')!.drawImage(video, 0, 0, canvas.width, canvas.height);
-		frameW = canvas.width;
-		frameH = canvas.height;
-		frame = await new Promise((resolve, reject) =>
-			canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('capture failed'))), 'image/jpeg', 0.85)
-		);
-	}
-
-	function addBlob(px: number, py: number) {
-		if (!scene || !currentGroup) return;
-		const rPx = screenRadius(CAULK_RADIUS[thickness]);
-		const blob = new THREE.Mesh(new THREE.SphereGeometry(rPx, 20, 14), caulkMaterial());
-		blob.position.set(px - window.innerWidth / 2, window.innerHeight / 2 - py, 0);
-		blob.scale.setScalar(caulkJitter(blobIndex++));
-		currentGroup.add(blob);
-	}
-
-	async function onDown(ev: PointerEvent) {
-		if (phase === 'live') {
-			// The frame under your first touch becomes the wall anchor — captured
-			// silently; the camera feed keeps running (no freeze).
-			await captureFrame();
-			phase = 'drawing';
-		}
-		if (phase !== 'drawing' || current) return;
-		(ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
-		current = [toImage(ev.clientX, ev.clientY)];
-		currentGroup = new THREE.Group();
-		scene?.add(currentGroup);
-		addBlob(ev.clientX, ev.clientY);
-	}
-
-	function onMove(ev: PointerEvent) {
-		if (!current) return;
-		const rPx = screenRadius(CAULK_RADIUS[thickness]);
-		const p = toImage(ev.clientX, ev.clientY);
-		const last = current[current.length - 1];
-		const distPx = Math.hypot(p[0] - last[0], p[1] - last[1]) * coverMap().dispW;
-		if (distPx < rPx * 0.6 || current.length >= 200) return;
-		current.push(p);
-		addBlob(ev.clientX, ev.clientY);
-	}
-
-	function strokeCost(points: Array<[number, number]>, r: number): number {
-		let len = 0;
-		for (let i = 1; i < points.length; i++)
-			len += Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]);
-		return Math.max(10, Math.round(Math.PI * r * r * len * 1e5));
-	}
-
-	function onUp() {
-		if (!current) return;
-		if (current.length >= 2 && currentGroup && scene) {
-			const r = CAULK_RADIUS[thickness];
-			const z = depthCm / 100;
-			// Swap the live bead preview for the smooth glossy tube (mock look).
-			currentGroup.parent?.remove(currentGroup);
-			const tube = buildCaulk(current, r, z);
-			tube.scale.setScalar(coverMap().dispW);
-			scene.add(tube);
-			strokes.push({ points: current, r, z });
-			strokeGroups.push(tube);
-			strokeCount = strokes.length;
-			pendingCost += strokeCost(current, r);
-		} else {
-			currentGroup?.parent?.remove(currentGroup);
-		}
-		current = null;
-		currentGroup = null;
-	}
-
-	function undo() {
-		const g = strokeGroups.pop();
-		g?.parent?.remove(g);
-		const st = strokes.pop();
-		if (st) pendingCost = Math.max(0, pendingCost - strokeCost(st.points, st.r));
-		strokeCount = strokes.length;
-		if (strokes.length === 0) resumeLive();
-	}
-
-	function discard() {
-		for (const g of strokeGroups) g.parent?.remove(g);
-		strokeGroups = [];
-		strokes = [];
-		strokeCount = 0;
-		pendingCost = 0;
-		resumeLive();
-	}
-
-	function resumeLive() {
-		frame = null;
-		phase = 'live';
-	}
-
-	/**
-	 * Fully background: hand the wall + strokes to an async pipeline and put
-	 * the user straight back into live drawing. The mesh visual builds over
-	 * the artwork while it anchors; a chip appears when the wall is set.
-	 */
-	async function save() {
-		if (!frame || strokes.length === 0 || bg) return;
-		const job = { frame, strokes: [...strokes], groups: [...strokeGroups] };
-		frame = null;
-		strokes = [];
-		strokeGroups = [];
-		strokeCount = 0;
-		pendingCost = 0;
-		phase = 'live';
-		bg = { label: 'ANCHORING', pct: 0 };
-		try {
-			// Compile from an 800px version: 3-4x faster, plenty for tracking.
-			const compileInput = await downscaleJpeg(job.frame, 800);
-			showMesh();
-			const target = await compileWallTarget(compileInput, (p) => {
-				bg = { label: 'ANCHORING', pct: p };
-				updateMesh(p);
-			});
-			hideMesh();
-			bg = { label: 'SAVING', pct: 100 };
-			gps = (await collectAveragedFix(1)) ?? gps;
-			const { imagePath, targetPath } = await uploadSpotAssets(job.frame, target);
-			const spot = await createSpot({
-				lat: gps?.lat ?? 0,
-				lon: gps?.lon ?? 0,
-				accuracy: gps?.accuracy ?? null,
-				name: null,
-				imagePath,
-				targetPath
-			});
-			for (const st of job.strokes) {
-				await placeCaulk({
-					spotId: spot.id,
-					lat: spot.lat,
-					lon: spot.lon,
-					accuracy: gps?.accuracy ?? null,
-					points: st.points,
-					radius: st.r,
-					depth: st.z
-				});
-			}
-			// Persisted — the screen-fixed copies have done their job.
-			for (const g of job.groups) g.parent?.remove(g);
-			bg = null;
-			savedSpotId = spot.id;
-			if (profile) profile = await getProfile(profile.id);
-		} catch (e) {
-			hideMesh();
-			bg = null;
-			// Give the strokes back so nothing is lost.
-			if (frame === null && strokes.length === 0) {
-				frame = job.frame;
-				strokes = job.strokes;
-				strokeGroups = job.groups;
-				strokeCount = strokes.length;
-				pendingCost = strokes.reduce((a, st) => a + strokeCost(st.points, st.r), 0);
-				phase = 'drawing';
-			}
-			errorMsg = e instanceof Error ? e.message : String(e);
-			setTimeout(() => (errorMsg = ''), 5000);
-		}
-	}
-
-	function holdStart() {
-		if (phase !== 'drawing' || strokeCount === 0 || bg) return;
-		holding = true;
-		holdTimer = setTimeout(() => {
-			holding = false;
-			void save();
-		}, 700);
-	}
-
-	function holdEnd() {
-		holding = false;
-		clearTimeout(holdTimer);
-	}
-
 	function stopEverything() {
-		clearTimeout(holdTimer);
-		renderer?.setAnimationLoop(null);
-		renderer?.dispose();
+		clearTimeout(lockTimer);
+		clearTimeout(toastTimer);
+		meshRenderer?.setAnimationLoop(null);
+		meshRenderer?.dispose();
+		meshRenderer = null;
 		stream?.getTracks().forEach((t) => t.stop());
 		stream = null;
+		disposeMindar();
 	}
 
 	onDestroy(stopEverything);
 </script>
 
-<div class="spray-root">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div
+	class="spray-root"
+	bind:this={container}
+	onpointerdown={onDown}
+	onpointermove={onMove}
+	onpointerup={onUp}
+	onpointercancel={onUp}
+>
 	<!-- svelte-ignore a11y_media_has_caption -->
 	<video bind:this={video} playsinline muted></video>
-	<canvas
-		bind:this={overlay}
-		onpointerdown={onDown}
-		onpointermove={onMove}
-		onpointerup={onUp}
-		onpointercancel={onUp}
-	></canvas>
+	<canvas bind:this={overlay} class="mesh-overlay"></canvas>
 
-	<div class="hud top">
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="hud top" onpointerdown={(e) => e.stopPropagation()}>
 		<button class="chip" onclick={() => goto('/')}>‹</button>
-		<span class="chip status">
-			{#if phase === 'boot'}Starting…{:else if phase === 'drawing'}EXTRUDING 3D · {costPct > 0 && costPct < 1 ? '<1' : costPct.toFixed(0)}%
-			{:else if bg}{bg.label} · {bg.pct.toFixed(0)}%
-			{:else}NEW WALL — just draw{/if}
+		<span class="chip status" class:ready={phase === 'ready'}>
+			{#if phase === 'boot'}Starting…
+			{:else if phase === 'aim'}MAPPING WALL…
+			{:else if phase === 'building'}BUILDING 3D MAP · {buildPct.toFixed(0)}%
+			{:else if phase === 'locking'}{remapCount > 0 ? 'REMAPPING · ' : ''}LOCKING…
+			{:else if phase === 'ready'}3D MAP LOCKED{/if}
 		</span>
-		{#if savedSpotId && !bg}
-			<button class="chip set-chip" onclick={() => goto(`/spots/${savedSpotId}`)}>Wall set ✓</button>
-		{/if}
-		{#if phase === 'drawing'}
-			<button class="chip" onclick={undo}>undo</button>
-			<button class="chip" onclick={discard}>✕</button>
+		{#if spotId}
+			<button class="chip" onclick={share}>share</button>
 		{/if}
 	</div>
 
-	{#if profile && (phase === 'live' || phase === 'drawing')}
+	{#if profile && phase !== 'boot' && phase !== 'error'}
 		<div class="meter" aria-hidden="true">
 			<span class="meter-label">VOLUME</span>
 			<div class="meter-bar"><div class="meter-fill" style="height: {meterPct}%"></div></div>
@@ -436,15 +482,14 @@
 		</div>
 	{/if}
 
-	{#if phase === 'live' || phase === 'drawing'}
-		<div class="hud bottom">
-			{#if phase === 'drawing' || phase === 'live'}
-				<label class="depth">
-					<span class="panel-label">DEPTH</span>
-					<input type="range" min="-5" max="15" step="1" bind:value={depthCm} />
-					<span class="depth-val">{depthCm} cm</span>
-				</label>
-			{/if}
+	{#if phase === 'ready' || phase === 'locking'}
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="hud bottom" onpointerdown={(e) => e.stopPropagation()}>
+			<label class="depth">
+				<span class="depth-label">DEPTH</span>
+				<input type="range" min="-5" max="15" step="1" bind:value={depthCm} />
+				<span class="depth-val">{depthCm} cm</span>
+			</label>
 			<div class="thickness">
 				{#each ['thin', 'medium', 'thick'] as const as t}
 					<button class="thick-btn" class:active={thickness === t} onclick={() => (thickness = t)}>
@@ -453,31 +498,11 @@
 					</button>
 				{/each}
 			</div>
-			{#if phase === 'drawing' && strokeCount > 0}
-				<div class="panel">
-					<div class="panel-col">
-						<span class="panel-label">VOLUME COST</span>
-						<span class="panel-big">{costPct > 0 && costPct < 1 ? '<1' : costPct.toFixed(0)}%</span>
-						<span class="panel-sub">−{fmtVolume(pendingCost)}</span>
-					</div>
-					<div class="panel-col">
-						<span class="panel-label">BALANCE</span>
-						<span class="panel-big">{fmtVolume(remaining)}</span>
-						<span class="panel-sub">{strokeCount} stroke{strokeCount === 1 ? '' : 's'}</span>
-					</div>
-					<button
-						class="hold-btn"
-						class:holding
-						onpointerdown={holdStart}
-						onpointerup={holdEnd}
-						onpointerleave={holdEnd}
-					>
-						<span class="hold-fill"></span>
-						<span class="hold-text">Place 3D tag<small>HOLD TO CONFIRM</small></span>
-					</button>
-				</div>
-			{/if}
-			{#if errorMsg}<p class="err">{errorMsg}</p>{/if}
+			<p class="tip">
+				{phase === 'ready'
+					? 'Draw directly on the wall'
+					: 'Hold the camera on the wall you mapped…'}
+			</p>
 		</div>
 	{/if}
 
@@ -487,6 +512,8 @@
 			<button class="cta" onclick={() => location.reload()}>Retry</button>
 		</div>
 	{/if}
+
+	{#if toast}<div class="toast">{toast}</div>{/if}
 </div>
 
 <style>
@@ -495,20 +522,22 @@
 		inset: 0;
 		background: #000;
 		overflow: hidden;
+		touch-action: none;
 	}
-	video,
-	canvas {
+	video {
+		object-fit: cover;
+	}
+	.spray-root :global(video),
+	.spray-root :global(canvas) {
 		position: absolute;
 		inset: 0;
 		width: 100%;
 		height: 100%;
 	}
-	video {
-		object-fit: cover;
-	}
-	canvas {
-		touch-action: none;
-		z-index: 2;
+	.mesh-overlay {
+		pointer-events: none;
+		z-index: 3;
+		display: none;
 	}
 	.hud {
 		position: absolute;
@@ -537,60 +566,14 @@
 		font-size: 0.85rem;
 		backdrop-filter: blur(8px);
 	}
-	.chip.set-chip {
-		border-color: #4ade80;
-		color: #4ade80;
-	}
 	.chip.status {
 		flex: 1;
 		text-align: center;
+		letter-spacing: 0.04em;
 	}
-	.thickness {
-		display: flex;
-		gap: 0.5rem;
-	}
-	.thick-btn {
-		flex: 1;
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 0.35rem;
-		background: rgba(11, 11, 15, 0.75);
-		border: 1px solid rgba(255, 255, 255, 0.15);
-		border-radius: 0.9rem;
-		color: var(--text);
-		padding: 0.6rem;
-		font-size: 0.85rem;
-		text-transform: capitalize;
-	}
-	.thick-btn.active {
-		background: rgba(123, 97, 255, 0.35);
-		border-color: var(--accent);
-	}
-	.dot {
-		background: #fff;
-		border-radius: 999px;
-	}
-	.dot.thin {
-		width: 0.4rem;
-		height: 0.4rem;
-	}
-	.dot.medium {
-		width: 1.6rem;
-		height: 0.5rem;
-	}
-	.dot.thick {
-		width: 2.4rem;
-		height: 0.6rem;
-	}
-	.cta {
-		background: linear-gradient(90deg, var(--accent), var(--accent-2));
-		color: #0b0b0f;
-		font-weight: 800;
-		font-size: 1.15rem;
-		border: none;
-		border-radius: 1rem;
-		padding: 1.1rem;
+	.chip.status.ready {
+		color: #4ade80;
+		border-color: rgba(74, 222, 128, 0.5);
 	}
 	.meter {
 		position: absolute;
@@ -639,6 +622,11 @@
 		border-radius: 999px;
 		padding: 0.35rem 0.9rem;
 	}
+	.depth-label {
+		font-size: 0.6rem;
+		letter-spacing: 0.1em;
+		color: var(--muted);
+	}
 	.depth input {
 		flex: 1;
 		accent-color: var(--accent);
@@ -649,68 +637,60 @@
 		min-width: 3.2rem;
 		text-align: right;
 	}
-	.panel {
+	.thickness {
 		display: flex;
-		align-items: stretch;
-		gap: 0.9rem;
-		background: rgba(11, 11, 15, 0.8);
-		border: 1px solid rgba(255, 255, 255, 0.12);
-		border-radius: 1.1rem;
-		padding: 0.8rem 1rem;
-		backdrop-filter: blur(10px);
+		gap: 0.5rem;
 	}
-	.panel-col {
-		display: flex;
-		flex-direction: column;
-		gap: 0.1rem;
-		justify-content: center;
-	}
-	.panel-label {
-		font-size: 0.6rem;
-		letter-spacing: 0.1em;
-		color: var(--muted);
-	}
-	.panel-big {
-		font-size: 1.25rem;
-		font-weight: 800;
-	}
-	.panel-sub {
-		font-size: 0.72rem;
-		color: var(--muted);
-	}
-	.hold-btn {
-		position: relative;
+	.thick-btn {
 		flex: 1;
-		border: none;
-		border-radius: 0.9rem;
-		background: linear-gradient(90deg, var(--accent), var(--accent-2));
-		color: #fff;
-		overflow: hidden;
-		padding: 0.7rem 1rem;
-	}
-	.hold-fill {
-		position: absolute;
-		inset: 0;
-		background: rgba(255, 255, 255, 0.35);
-		transform: scaleX(0);
-		transform-origin: left;
-	}
-	.hold-btn.holding .hold-fill {
-		transition: transform 0.7s linear;
-		transform: scaleX(1);
-	}
-	.hold-text {
-		position: relative;
 		display: flex;
 		flex-direction: column;
-		font-weight: 800;
-		font-size: 1rem;
+		align-items: center;
+		gap: 0.35rem;
+		background: rgba(11, 11, 15, 0.75);
+		border: 1px solid rgba(255, 255, 255, 0.15);
+		border-radius: 0.9rem;
+		color: var(--text);
+		padding: 0.6rem;
+		font-size: 0.85rem;
+		text-transform: capitalize;
 	}
-	.hold-text small {
-		font-weight: 500;
-		font-size: 0.6rem;
-		letter-spacing: 0.12em;
-		opacity: 0.85;
+	.thick-btn.active {
+		background: rgba(123, 97, 255, 0.35);
+		border-color: var(--accent);
+	}
+	.dot {
+		background: #fff;
+		border-radius: 999px;
+	}
+	.dot.thin {
+		width: 0.4rem;
+		height: 0.4rem;
+	}
+	.dot.medium {
+		width: 1.6rem;
+		height: 0.5rem;
+	}
+	.dot.thick {
+		width: 2.4rem;
+		height: 0.6rem;
+	}
+	.tip {
+		color: var(--text);
+		background: rgba(11, 11, 15, 0.7);
+		border-radius: 999px;
+		padding: 0.45rem 1rem;
+		font-size: 0.9rem;
+		margin: 0 auto;
+	}
+	.cta {
+		background: linear-gradient(90deg, var(--accent), var(--accent-2));
+		color: #0b0b0f;
+		font-weight: 800;
+		font-size: 1.15rem;
+		border: none;
+		border-radius: 1rem;
+		padding: 1.1rem 2.5rem;
 	}
 	.center {
 		position: absolute;
@@ -726,10 +706,17 @@
 		padding: 2rem;
 		background: rgba(0, 0, 0, 0.45);
 	}
-	.err {
-		color: #fca5a5;
-		text-align: center;
-		margin: 0;
+	.toast {
+		position: absolute;
+		top: calc(env(safe-area-inset-top) + 4rem);
+		left: 50%;
+		transform: translateX(-50%);
+		background: rgba(11, 11, 15, 0.9);
+		border: 1px solid rgba(255, 255, 255, 0.2);
+		border-radius: 999px;
+		padding: 0.5rem 1.1rem;
 		font-size: 0.9rem;
+		z-index: 30;
+		white-space: nowrap;
 	}
 </style>
