@@ -20,6 +20,7 @@ export class ArSession {
 	private clickHandler: any = null;
 	private tagObjects = new Map<string, THREE.Object3D>();
 	private disposed = false;
+	private fixBuffer: Array<GpsFix & { t: number }> = [];
 
 	lastFix: GpsFix | null = null;
 	onGps: (fix: GpsFix, distMoved: number) => void = () => {};
@@ -30,7 +31,9 @@ export class ArSession {
 	async start(): Promise<void> {
 		this.app = new LocAR.App({
 			canvas: this.canvas,
-			gpsOptions: { gpsMinDistance: 2 },
+			// gpsMinDistance 0: receive EVERY fix so standing still keeps feeding
+			// the averaging buffer instead of starving it.
+			gpsOptions: { gpsMinDistance: 0 },
 			deviceOrientationOptions: {
 				enabled: true,
 				// LocAR shows its own tap-to-allow dialog on iOS: DeviceOrientation
@@ -54,6 +57,9 @@ export class ArSession {
 				alt: c.altitude,
 				accuracy: c.accuracy
 			};
+			const now = Date.now();
+			this.fixBuffer.push({ ...this.lastFix, t: now });
+			this.fixBuffer = this.fixBuffer.filter((f) => now - f.t < 10_000).slice(-20);
 			this.onGps(this.lastFix, e.distMoved);
 		});
 		await this.locar.startGps();
@@ -86,15 +92,48 @@ export class ArSession {
 		return null;
 	}
 
-	/** Current pose for placement + v2-migration logging. */
-	pose(): PlacementPose | null {
-		if (!this.lastFix) return null;
+	/**
+	 * Inverse-variance weighted average of the last ~8 s of fixes. Standing
+	 * still for a few seconds beats any single noisy fix; the combined
+	 * accuracy is optimistic (GPS errors correlate), so floor it at 3 m.
+	 */
+	averagedFix(): GpsFix | null {
+		const now = Date.now();
+		const recent = this.fixBuffer.filter((f) => now - f.t < 8_000 && f.accuracy > 0);
+		if (recent.length < 2) return this.lastFix;
+		let sw = 0,
+			lat = 0,
+			lon = 0,
+			alt = 0,
+			altw = 0;
+		for (const f of recent) {
+			const w = 1 / (f.accuracy * f.accuracy);
+			sw += w;
+			lat += f.lat * w;
+			lon += f.lon * w;
+			if (f.alt !== null) {
+				alt += f.alt * w;
+				altw += w;
+			}
+		}
 		return {
-			lat: this.lastFix.lat,
-			lon: this.lastFix.lon,
-			alt: this.lastFix.alt,
+			lat: lat / sw,
+			lon: lon / sw,
+			alt: altw > 0 ? alt / altw : null,
+			accuracy: Math.max(3, Math.sqrt(1 / sw))
+		};
+	}
+
+	/** Current pose for placement + v2-migration logging (GPS-averaged). */
+	pose(): PlacementPose | null {
+		const fix = this.averagedFix();
+		if (!fix) return null;
+		return {
+			lat: fix.lat,
+			lon: fix.lon,
+			alt: fix.alt,
 			heading: this.heading(),
-			accuracy: this.lastFix.accuracy
+			accuracy: fix.accuracy
 		};
 	}
 
@@ -151,6 +190,28 @@ export class ArSession {
 			video.remove();
 		}
 	}
+}
+
+/** Haversine distance in metres. */
+export function distanceM(lat1: number, lon1: number, lat2: number, lon2: number): number {
+	const R = 6371000;
+	const p1 = (lat1 * Math.PI) / 180;
+	const p2 = (lat2 * Math.PI) / 180;
+	const dp = ((lat2 - lat1) * Math.PI) / 180;
+	const dl = ((lon2 - lon1) * Math.PI) / 180;
+	const a =
+		Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+	return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/** Initial bearing in degrees (0 = north, clockwise) from point 1 to point 2. */
+export function bearingDeg(lat1: number, lon1: number, lat2: number, lon2: number): number {
+	const p1 = (lat1 * Math.PI) / 180;
+	const p2 = (lat2 * Math.PI) / 180;
+	const dl = ((lon2 - lon1) * Math.PI) / 180;
+	const y = Math.sin(dl) * Math.cos(p2);
+	const x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+	return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
 }
 
 /** Move a lat/lon point `distM` metres along `headingDeg` (small distances). */
