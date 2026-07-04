@@ -4,18 +4,10 @@
 	import { page } from '$app/state';
 	import * as THREE from 'three';
 	import { ensureSession } from '$lib/supabase';
-	import { getSpot, spotTags, placeTag, placeCaulk, appraiseTag, spotFileUrl, getProfile } from '$lib/api';
+	import { getSpot, spotTags, placeCaulk, appraiseTag, spotFileUrl, getProfile } from '$lib/api';
 	import { distanceM } from '$lib/ar/session';
-	import { buildBuiltin, buildCaulk, caulkMaterial, LIBRARY } from '$lib/library';
-	import {
-		SIZE_COST,
-		SPOT_SIZE_SCALE,
-		fmtVolume,
-		type Profile,
-		type SizeClass,
-		type Spot,
-		type SpotTag
-	} from '$lib/types';
+	import { buildBuiltin, buildCaulk, caulkMaterial } from '$lib/library';
+	import { SPOT_SIZE_SCALE, fmtVolume, type Profile, type Spot, type SpotTag } from '$lib/types';
 
 	let container: HTMLDivElement;
 	let spot = $state<Spot | null>(null);
@@ -28,14 +20,11 @@
 	let tags = $state<SpotTag[]>([]);
 	let selectedTag = $state<SpotTag | null>(null);
 
-	let selectedItem = $state(LIBRARY[0]);
-	let selectedSize = $state<SizeClass>('m');
 	let spotDistance = $state<number | null>(null);
 
 	// Caulk tool — the mockups' "tag with caulk" flow.
 	type Thickness = 'thin' | 'medium' | 'thick';
 	const CAULK_RADIUS: Record<Thickness, number> = { thin: 0.015, medium: 0.03, thick: 0.05 };
-	let tool = $state<'caulk' | 'sticker'>('caulk');
 	let thickness = $state<Thickness>('medium');
 	let strokeCost = $state(0);
 	let stroke: Array<[number, number]> = [];
@@ -106,7 +95,7 @@
 	}
 
 	function onPointerDown(ev: PointerEvent) {
-		if (tool !== 'caulk' || phase !== 'locked' || placing) return;
+		if (phase !== 'locked' || placing) return;
 		const p = wallPoint(ev);
 		if (!p || !anchorGroup) return;
 		drawing = true;
@@ -213,64 +202,14 @@
 		return false;
 	}
 
-	/** Sticker mode: tap an existing tag to select it, tap empty wall to place. */
-	async function onStickerTap(ev: PointerEvent) {
-		if (phase !== 'locked') return;
-		if (trySelect(ev)) return;
-		const p = wallPoint(ev);
-		if (p) await placeOnWall(p.x, p.y);
-	}
-
 	function handlePointerDown(ev: PointerEvent) {
-		if (tool === 'caulk') onPointerDown(ev);
-		else void onStickerTap(ev);
+		onPointerDown(ev);
 	}
 
 	function handlePointerUp(ev: PointerEvent) {
-		if (tool !== 'caulk') return;
 		const wasStroke = stroke.length >= 2;
 		void onPointerUp();
-		if (!wasStroke) trySelect(ev); // a mere tap in caulk mode = select
-	}
-
-	async function placeOnWall(x: number, y: number) {
-		if (!spot || placing) return;
-		const cost = SIZE_COST[selectedSize];
-		if (remaining < cost) {
-			showToast(`Not enough volume (${cost} cm³ needed)`);
-			return;
-		}
-		placing = true;
-		try {
-			const xy = { x, y, s: 1 };
-			const placed = await placeTag(
-				// The tag inherits the SPOT's surveyed position — better than the
-				// placer's momentary GPS.
-				{ lat: spot.lat, lon: spot.lon, alt: null, heading: null, accuracy: spot.accuracy_m ?? null },
-				`builtin:${selectedItem.id}`,
-				selectedSize,
-				{ id: spot.id, xy }
-			);
-			const spotTag: SpotTag = {
-				id: placed.id,
-				creator_id: placed.creator_id,
-				model_url: placed.model_url,
-				size_class: placed.size_class,
-				spot_xy: xy,
-				appraisals: 0,
-				appraised: false,
-				created_at: placed.created_at
-			};
-			tags = [...tags, spotTag];
-			addTagMesh(spotTag);
-			await refreshProfile();
-			showToast('Tagged the wall!');
-		} catch (e) {
-			const msg = e instanceof Error ? e.message : String(e);
-			showToast(msg.includes('insufficient') ? 'Spray can is empty!' : msg);
-		} finally {
-			placing = false;
-		}
+		if (!wasStroke) trySelect(ev); // a mere tap = select
 	}
 
 	async function appraise(tag: SpotTag) {
@@ -404,61 +343,27 @@
 
 	{#if spot && phase === 'scanning'}
 		<div class="hint">
-			<img src={spotFileUrl(spot.image_path)} alt="find this wall" />
-			<p>
-				Find this surface and point your camera at it{#if spotDistance !== null && spotDistance > 25}
-					· {spotDistance < 1000 ? `${spotDistance.toFixed(0)} m` : `${(spotDistance / 1000).toFixed(1)} km`} away{/if}
-			</p>
+			<img src={spotFileUrl(spot.image_path)} alt="the wall" />
+			{#if spotDistance !== null && spotDistance > 25}
+				<p>{spotDistance < 1000 ? `${spotDistance.toFixed(0)} m` : `${(spotDistance / 1000).toFixed(1)} km`}</p>
+			{/if}
 		</div>
 	{/if}
 
 	{#if phase === 'locked' || phase === 'scanning'}
 		<div class="hud bottom">
-			<div class="tools">
-				<button class="chip" class:sel={tool === 'caulk'} onclick={() => (tool = 'caulk')}>
-					Caulk
-				</button>
-				<button class="chip" class:sel={tool === 'sticker'} onclick={() => (tool = 'sticker')}>
-					Stickers
-				</button>
-				{#if strokeCost > 0}<span class="chip cost">−{strokeCost} cm³</span>{/if}
+			{#if strokeCost > 0}<span class="chip cost">−{strokeCost} cm³</span>{/if}
+			<div class="thickness">
+				{#each ['thin', 'medium', 'thick'] as const as t}
+					<button class="thick-btn" class:active={thickness === t} onclick={() => (thickness = t)}>
+						<span class="dot {t}"></span>
+						{t}
+					</button>
+				{/each}
 			</div>
-
-			{#if tool === 'caulk'}
-				<div class="thickness">
-					{#each ['thin', 'medium', 'thick'] as const as t}
-						<button class="thick-btn" class:active={thickness === t} onclick={() => (thickness = t)}>
-							<span class="dot {t}"></span>
-							{t}
-						</button>
-					{/each}
-				</div>
-				<p class="tip">
-					{phase === 'locked' ? 'Hold & drag on the wall to spray' : 'Lock onto the wall first'}
-				</p>
-			{:else}
-				<div class="picker">
-					{#each LIBRARY as item (item.id)}
-						<button
-							class="swatch"
-							class:active={selectedItem.id === item.id}
-							onclick={() => (selectedItem = item)}>{item.label}</button
-						>
-					{/each}
-				</div>
-				<div class="sizes">
-					{#each ['s', 'm', 'l'] as const as size}
-						<button
-							class="swatch size"
-							class:active={selectedSize === size}
-							onclick={() => (selectedSize = size)}
-						>
-							{size.toUpperCase()}<small>{SIZE_COST[size]}</small>
-						</button>
-					{/each}
-				</div>
-				<p class="tip">Tap the wall to place{placing ? '…' : ''}</p>
-			{/if}
+			<p class="tip">
+				{phase === 'locked' ? 'Hold & drag on the wall to spray' : 'Locking onto the wall…'}
+			</p>
 		</div>
 	{/if}
 
@@ -546,76 +451,28 @@
 	}
 	.hint {
 		position: absolute;
-		top: 50%;
-		left: 50%;
-		transform: translate(-50%, -50%);
+		left: 0.75rem;
+		bottom: calc(9rem + env(safe-area-inset-bottom));
 		display: flex;
 		flex-direction: column;
-		align-items: center;
-		gap: 0.6rem;
+		align-items: flex-start;
+		gap: 0.35rem;
 		z-index: 5;
 		pointer-events: none;
 	}
 	.hint img {
-		width: 9rem;
-		border-radius: 0.8rem;
-		border: 2px solid rgba(255, 255, 255, 0.4);
-		opacity: 0.85;
+		width: 5.5rem;
+		border-radius: 0.6rem;
+		border: 1.5px solid rgba(255, 255, 255, 0.35);
+		opacity: 0.8;
 	}
 	.hint p {
 		color: var(--text);
 		background: rgba(11, 11, 15, 0.7);
 		border-radius: 999px;
-		padding: 0.4rem 1rem;
-		font-size: 0.9rem;
-		margin: 0;
-	}
-	.picker {
-		display: flex;
-		gap: 0.4rem;
-		overflow-x: auto;
-		padding-bottom: 0.25rem;
-	}
-	.swatch {
-		background: rgba(11, 11, 15, 0.75);
-		border: 1px solid rgba(255, 255, 255, 0.15);
-		border-radius: 0.8rem;
-		min-width: 3rem;
-		height: 3rem;
+		padding: 0.25rem 0.7rem;
 		font-size: 0.8rem;
-		font-weight: 700;
-		letter-spacing: 0.04em;
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		justify-content: center;
-		color: var(--text);
-	}
-	.swatch.active {
-		border-color: var(--accent);
-		box-shadow: 0 0 0 2px var(--accent);
-	}
-	.swatch.size {
-		font-size: 0.95rem;
-		font-weight: 700;
-	}
-	.swatch.size small {
-		font-weight: 400;
-		font-size: 0.6rem;
-		color: var(--muted);
-	}
-	.sizes {
-		display: flex;
-		gap: 0.4rem;
-	}
-	.tools {
-		display: flex;
-		gap: 0.5rem;
-		align-items: center;
-	}
-	.chip.sel {
-		border-color: var(--accent);
-		box-shadow: 0 0 0 1px var(--accent);
+		margin: 0;
 	}
 	.chip.cost {
 		color: #fbbf24;
