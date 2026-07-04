@@ -159,7 +159,11 @@ export class ArSession {
 
 	addTag(tag: NearbyTag): void {
 		if (!this.locar || this.tagObjects.has(tag.id)) return;
-		const builtinId = tag.model_url.startsWith('builtin:') ? tag.model_url.slice(8) : null;
+		const builtinId = tag.model_url.startsWith('builtin:')
+			? tag.model_url.slice(8)
+			: tag.model_url === 'caulk'
+				? 'caulk'
+				: null;
 		const obj = builtinId ? buildBuiltin(builtinId, tag.size_class) : null;
 		if (!obj) {
 			// GLB URLs (post-MVP user uploads) would be GLTF-loaded here.
