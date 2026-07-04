@@ -9,6 +9,7 @@
 	import {
 		SIZE_COST,
 		SPOT_SIZE_SCALE,
+		fmtVolume,
 		type Profile,
 		type SizeClass,
 		type Spot,
@@ -373,7 +374,7 @@
 <div class="spot-root" bind:this={container}>
 	<div class="hud top">
 		<button class="chip" onclick={() => goto('/ar')}>‹ AR</button>
-		{#if profile}<span class="chip">{remaining.toFixed(0)} cm³</span>{/if}
+		{#if profile}<span class="chip">{fmtVolume(remaining)}</span>{/if}
 		<span class="chip" class:locked={phase === 'locked'}>
 			{#if phase === 'loading'}loading…{:else if phase === 'scanning'}Point at the wall
 			{:else if phase === 'locked'}LOCKED · {tags.length} tags{:else}error{/if}
