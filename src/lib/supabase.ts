@@ -3,8 +3,14 @@ import { env } from '$env/dynamic/public';
 
 let client: SupabaseClient | null = null;
 
+// New Supabase projects issue sb_publishable_... keys; older ones a JWT "anon"
+// key. Either works with supabase-js — accept both env names.
+function publicKey(): string | undefined {
+	return env.PUBLIC_SUPABASE_ANON_KEY || env.PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+}
+
 export function isConfigured(): boolean {
-	return Boolean(env.PUBLIC_SUPABASE_URL && env.PUBLIC_SUPABASE_ANON_KEY);
+	return Boolean(env.PUBLIC_SUPABASE_URL && publicKey());
 }
 
 export function supabase(): SupabaseClient {
@@ -12,7 +18,7 @@ export function supabase(): SupabaseClient {
 		if (!isConfigured()) {
 			throw new Error('Supabase is not configured — copy .env.example to .env');
 		}
-		client = createClient(env.PUBLIC_SUPABASE_URL!, env.PUBLIC_SUPABASE_ANON_KEY!);
+		client = createClient(env.PUBLIC_SUPABASE_URL!, publicKey()!);
 	}
 	return client;
 }
