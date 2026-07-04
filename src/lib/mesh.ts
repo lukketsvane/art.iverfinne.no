@@ -198,3 +198,30 @@ export function triangulate(pts: Array<{ x: number; y: number }>): Array<[number
 	}
 	return Array.from(edges, (k) => k.split('_').map(Number) as [number, number]);
 }
+
+/** Mean luminance of a frame, 0..1 — match virtual paint to the room light. */
+export function avgLuminance(img: ImageData): number {
+	const d = img.data;
+	const n = img.width * img.height;
+	let sum = 0;
+	for (let i = 0, p = 0; i < n; i++, p += 4) {
+		sum += 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2];
+	}
+	return sum / n / 255;
+}
+
+/** Sample the live camera feed's luminance (0..1); 0.45 if unavailable. */
+export function videoLuminance(video: HTMLVideoElement | null): number {
+	if (!video || !video.videoWidth) return 0.45;
+	const c = document.createElement('canvas');
+	c.width = 48;
+	c.height = 48;
+	const ctx = c.getContext('2d', { willReadFrequently: true });
+	if (!ctx) return 0.45;
+	try {
+		ctx.drawImage(video, 0, 0, 48, 48);
+		return avgLuminance(ctx.getImageData(0, 0, 48, 48));
+	} catch {
+		return 0.45;
+	}
+}

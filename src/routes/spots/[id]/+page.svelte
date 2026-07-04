@@ -6,6 +6,7 @@
 	import { ensureSession } from '$lib/supabase';
 	import { getSpot, spotTags, placeCaulk, appraiseTag, spotFileUrl, getProfile, errText } from '$lib/api';
 	import { buildVoxels, type VoxelCell } from '$lib/voxel';
+	import { videoLuminance } from '$lib/mesh';
 	import { distanceM } from '$lib/ar/session';
 	import { buildBuiltin, buildCaulk, caulkMaterial } from '$lib/library';
 	import { SPOT_SIZE_SCALE, fmtVolume, type Profile, type Spot, type SpotTag } from '$lib/types';
@@ -281,7 +282,10 @@
 				filterMinCF: 0.0001,
 				filterBeta: 0.001
 			});
-			mindar.scene.add(new THREE.HemisphereLight(0xffffff, 0x334155, 2.2));
+			const hemi = new THREE.HemisphereLight(0xffffff, 0x334155, 1.4);
+			const key = new THREE.DirectionalLight(0xffffff, 0.6);
+			key.position.set(0.6, 1, 1.2);
+			mindar.scene.add(hemi, key);
 			const anchor = mindar.addAnchor(0);
 			anchorGroup = anchor.group;
 
@@ -299,7 +303,14 @@
 
 			await mindar.start();
 			phase = 'scanning';
+			// Match the paint to the room's actual brightness (re-sampled live).
+			let lightFrame = 0;
 			mindar.renderer.setAnimationLoop(() => {
+				if (lightFrame++ % 90 === 0) {
+					const lum = videoLuminance(container.querySelector('video'));
+					hemi.intensity = 0.5 + 2.6 * lum;
+					key.intensity = 0.2 + 1.1 * lum;
+				}
 				mindar.renderer.render(mindar.scene, mindar.camera);
 			});
 			// MindAR appends its <video> ABOVE the renderer canvas, so canvas-level
