@@ -23,6 +23,18 @@
 		-webkit-font-smoothing: antialiased;
 		overscroll-behavior: none;
 	}
+	/* App feel: nothing on screen is selectable or long-press-copyable... */
+	:global(*) {
+		-webkit-user-select: none;
+		user-select: none;
+		-webkit-touch-callout: none;
+		-webkit-tap-highlight-color: transparent;
+	}
+	/* ...except actual text inputs. */
+	:global(input, textarea) {
+		-webkit-user-select: text;
+		user-select: text;
+	}
 	:global(button) {
 		font: inherit;
 	}
