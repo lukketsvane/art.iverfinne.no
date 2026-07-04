@@ -4,8 +4,8 @@
 	import { page } from '$app/state';
 	import * as THREE from 'three';
 	import { ensureSession } from '$lib/supabase';
-	import { getSpot, spotTags, placeTag, appraiseTag, spotFileUrl, getProfile } from '$lib/api';
-	import { buildBuiltin, LIBRARY } from '$lib/library';
+	import { getSpot, spotTags, placeTag, placeCaulk, appraiseTag, spotFileUrl, getProfile } from '$lib/api';
+	import { buildBuiltin, buildCaulk, caulkMaterial, LIBRARY } from '$lib/library';
 	import {
 		SIZE_COST,
 		SPOT_SIZE_SCALE,
@@ -21,7 +21,6 @@
 	let errorMsg = $state('');
 	let toast = $state('');
 	let placing = $state(false);
-	let placeMode = $state(false);
 	let userId = $state<string | null>(null);
 	let profile = $state<Profile | null>(null);
 	let tags = $state<SpotTag[]>([]);
@@ -29,6 +28,16 @@
 
 	let selectedItem = $state(LIBRARY[0]);
 	let selectedSize = $state<SizeClass>('m');
+
+	// Caulk tool — the mockups' "tag with caulk" flow.
+	type Thickness = 'thin' | 'medium' | 'thick';
+	const CAULK_RADIUS: Record<Thickness, number> = { thin: 0.015, medium: 0.03, thick: 0.05 };
+	let tool = $state<'caulk' | 'sticker'>('caulk');
+	let thickness = $state<Thickness>('medium');
+	let strokeCost = $state(0);
+	let stroke: Array<[number, number]> = [];
+	let strokePreview: THREE.Group | null = null;
+	let drawing = false;
 
 	let mindar: any = null;
 	let anchorGroup: THREE.Group | null = null;
@@ -47,20 +56,29 @@
 
 	function addTagMesh(tag: SpotTag) {
 		if (!anchorGroup || tagObjects.has(tag.id) || !tag.spot_xy) return;
-		const builtinId = tag.model_url.startsWith('builtin:') ? tag.model_url.slice(8) : null;
-		const obj = builtinId ? buildBuiltin(builtinId, tag.size_class) : null;
+		let obj: THREE.Object3D | null = null;
+		const xy = tag.spot_xy as { x?: number; y?: number; s?: number; points?: Array<[number, number]>; r?: number };
+		if (tag.model_url === 'caulk' && xy.points && xy.r) {
+			obj = buildCaulk(xy.points, xy.r);
+		} else {
+			const builtinId = tag.model_url.startsWith('builtin:') ? tag.model_url.slice(8) : null;
+			obj = builtinId ? buildBuiltin(builtinId, tag.size_class) : null;
+			if (obj) {
+				// buildBuiltin scales in metres (sensor-AR world); rescale to image units.
+				obj.scale.setScalar(SPOT_SIZE_SCALE[tag.size_class] * (xy.s || 1));
+				obj.position.set(xy.x ?? 0, xy.y ?? 0, 0.04);
+			}
+		}
 		if (!obj) return;
-		// buildBuiltin scales in metres (sensor-AR world); rescale to image units.
-		obj.scale.setScalar(SPOT_SIZE_SCALE[tag.size_class] * (tag.spot_xy.s || 1));
-		obj.position.set(tag.spot_xy.x, tag.spot_xy.y, 0.04);
 		obj.userData.tagId = tag.id;
 		obj.traverse((c) => (c.userData.tagId = tag.id));
 		anchorGroup.add(obj);
 		tagObjects.set(tag.id, obj);
 	}
 
-	async function onTap(ev: PointerEvent) {
-		if (!mindar || !anchorGroup || phase !== 'locked') return;
+	/** Raycast a pointer event onto the wall plane; returns local coords. */
+	function wallPoint(ev: PointerEvent): THREE.Vector3 | null {
+		if (!mindar || !anchorGroup || !tapPlane) return null;
 		const el = mindar.renderer.domElement as HTMLCanvasElement;
 		const r = el.getBoundingClientRect();
 		const ndc = new THREE.Vector2(
@@ -68,24 +86,148 @@
 			-(((ev.clientY - r.top) / r.height) * 2 - 1)
 		);
 		raycaster.setFromCamera(ndc, mindar.camera);
-		const hits = raycaster.intersectObjects(anchorGroup.children, true);
-		if (!hits.length) return;
+		const hits = raycaster.intersectObject(tapPlane, false);
+		if (!hits.length) return null;
+		return anchorGroup.worldToLocal(hits[0].point.clone());
+	}
 
-		if (placeMode) {
-			const local = anchorGroup.worldToLocal(hits[0].point.clone());
-			await placeOnWall(local.x, local.y);
-		} else {
-			for (const hit of hits) {
-				let cur: THREE.Object3D | null = hit.object;
-				while (cur) {
-					if (cur.userData.tagId) {
-						selectedTag = tags.find((t) => t.id === cur!.userData.tagId) ?? null;
-						return;
-					}
-					cur = cur.parent;
+	function strokeLength(points: Array<[number, number]>): number {
+		let len = 0;
+		for (let i = 1; i < points.length; i++)
+			len += Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]);
+		return len;
+	}
+
+	function estimateCost(points: Array<[number, number]>, r: number): number {
+		return Math.max(10, Math.round(Math.PI * r * r * strokeLength(points) * 1e5));
+	}
+
+	function onPointerDown(ev: PointerEvent) {
+		if (tool !== 'caulk' || phase !== 'locked' || placing) return;
+		const p = wallPoint(ev);
+		if (!p || !anchorGroup) return;
+		drawing = true;
+		(ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+		stroke = [[p.x, p.y]];
+		strokePreview = new THREE.Group();
+		anchorGroup.add(strokePreview);
+		addBlob(p.x, p.y);
+		strokeCost = 0;
+	}
+
+	function onPointerMove(ev: PointerEvent) {
+		if (!drawing || !strokePreview) return;
+		const p = wallPoint(ev);
+		if (!p) return;
+		const last = stroke[stroke.length - 1];
+		const r = CAULK_RADIUS[thickness];
+		if (Math.hypot(p.x - last[0], p.y - last[1]) < r * 0.6) return;
+		if (stroke.length >= 200) return;
+		stroke.push([p.x, p.y]);
+		addBlob(p.x, p.y);
+		strokeCost = estimateCost(stroke, r);
+	}
+
+	function addBlob(x: number, y: number) {
+		if (!strokePreview) return;
+		const r = CAULK_RADIUS[thickness];
+		const blob = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 14), caulkMaterial());
+		blob.position.set(x, y, r * 0.6);
+		strokePreview.add(blob);
+	}
+
+	async function onPointerUp() {
+		if (!drawing) return;
+		drawing = false;
+		const points = stroke;
+		const preview = strokePreview;
+		stroke = [];
+		strokePreview = null;
+		strokeCost = 0;
+		if (!spot || points.length < 2) {
+			preview?.parent?.remove(preview);
+			return;
+		}
+		placing = true;
+		try {
+			const r = CAULK_RADIUS[thickness];
+			const placed = await placeCaulk({
+				spotId: spot.id,
+				lat: spot.lat,
+				lon: spot.lon,
+				accuracy: spot.accuracy_m ?? null,
+				points,
+				radius: r
+			});
+			const spotTag: SpotTag = {
+				id: placed.id,
+				creator_id: placed.creator_id,
+				model_url: 'caulk',
+				size_class: thickness === 'thin' ? 's' : thickness === 'thick' ? 'l' : 'm',
+				spot_xy: { points, r } as never,
+				appraisals: 0,
+				appraised: false,
+				created_at: placed.created_at
+			};
+			// The live preview already looks right — adopt it as the tag mesh.
+			if (preview) {
+				preview.userData.tagId = placed.id;
+				preview.traverse((c) => (c.userData.tagId = placed.id));
+				tagObjects.set(placed.id, preview);
+			}
+			tags = [...tags, spotTag];
+			await refreshProfile();
+			showToast(`Sprayed! −${placed.volume_cm3.toFixed(0)} cm³`);
+		} catch (e) {
+			preview?.parent?.remove(preview);
+			const msg = e instanceof Error ? e.message : String(e);
+			showToast(msg.includes('insufficient') ? 'Spray can is empty!' : msg);
+		} finally {
+			placing = false;
+		}
+	}
+
+	/** Find an existing tag under the pointer; select it. Returns true if hit. */
+	function trySelect(ev: PointerEvent): boolean {
+		if (!mindar || !anchorGroup) return false;
+		const el = mindar.renderer.domElement as HTMLCanvasElement;
+		const r = el.getBoundingClientRect();
+		const ndc = new THREE.Vector2(
+			((ev.clientX - r.left) / r.width) * 2 - 1,
+			-(((ev.clientY - r.top) / r.height) * 2 - 1)
+		);
+		raycaster.setFromCamera(ndc, mindar.camera);
+		for (const hit of raycaster.intersectObjects(anchorGroup.children, true)) {
+			let cur: THREE.Object3D | null = hit.object;
+			while (cur) {
+				if (cur.userData.tagId) {
+					selectedTag = tags.find((t) => t.id === cur!.userData.tagId) ?? null;
+					return true;
 				}
+				cur = cur.parent;
 			}
 		}
+		return false;
+	}
+
+	/** Sticker mode: tap an existing tag to select it, tap empty wall to place. */
+	async function onStickerTap(ev: PointerEvent) {
+		if (phase !== 'locked') return;
+		if (trySelect(ev)) return;
+		const p = wallPoint(ev);
+		if (p) await placeOnWall(p.x, p.y);
+	}
+
+	function handlePointerDown(ev: PointerEvent) {
+		if (tool === 'caulk') onPointerDown(ev);
+		else void onStickerTap(ev);
+	}
+
+	function handlePointerUp(ev: PointerEvent) {
+		if (tool !== 'caulk') return;
+		const wasStroke = stroke.length >= 2;
+		void onPointerUp();
+		if (!wasStroke) trySelect(ev); // a mere tap in caulk mode = select
 	}
 
 	async function placeOnWall(x: number, y: number) {
@@ -118,7 +260,6 @@
 			};
 			tags = [...tags, spotTag];
 			addTagMesh(spotTag);
-			placeMode = false;
 			await refreshProfile();
 			showToast('Tagged the wall!');
 		} catch (e) {
@@ -203,7 +344,11 @@
 			mindar.renderer.setAnimationLoop(() => {
 				mindar.renderer.render(mindar.scene, mindar.camera);
 			});
-			mindar.renderer.domElement.addEventListener('pointerdown', onTap);
+			const el = mindar.renderer.domElement as HTMLCanvasElement;
+			el.style.touchAction = 'none';
+			el.addEventListener('pointerdown', handlePointerDown);
+			el.addEventListener('pointermove', onPointerMove);
+			el.addEventListener('pointerup', handlePointerUp);
 		} catch (e) {
 			phase = 'error';
 			errorMsg = e instanceof Error ? e.message : String(e);
@@ -214,7 +359,10 @@
 		clearTimeout(toastTimer);
 		try {
 			mindar?.renderer?.setAnimationLoop(null);
-			mindar?.renderer?.domElement?.removeEventListener('pointerdown', onTap);
+			const el = mindar?.renderer?.domElement;
+			el?.removeEventListener('pointerdown', handlePointerDown);
+			el?.removeEventListener('pointermove', onPointerMove);
+			el?.removeEventListener('pointerup', handlePointerUp);
 			mindar?.stop();
 		} catch {
 			/* teardown must never throw */
@@ -225,10 +373,10 @@
 <div class="spot-root" bind:this={container}>
 	<div class="hud top">
 		<button class="chip" onclick={() => goto('/ar')}>‹ AR</button>
-		{#if profile}<span class="chip">🧯 {remaining.toFixed(0)} cm³</span>{/if}
+		{#if profile}<span class="chip">{remaining.toFixed(0)} cm³</span>{/if}
 		<span class="chip" class:locked={phase === 'locked'}>
-			{#if phase === 'loading'}loading…{:else if phase === 'scanning'}🔍 point at the wall
-			{:else if phase === 'locked'}🧱 locked · {tags.length} tags{:else}error{/if}
+			{#if phase === 'loading'}loading…{:else if phase === 'scanning'}Point at the wall
+			{:else if phase === 'locked'}LOCKED · {tags.length} tags{:else}error{/if}
 		</span>
 		<button class="chip" onclick={share}>share</button>
 	</div>
@@ -249,35 +397,50 @@
 
 	{#if phase === 'locked' || phase === 'scanning'}
 		<div class="hud bottom">
-			{#if placeMode}
+			<div class="tools">
+				<button class="chip" class:sel={tool === 'caulk'} onclick={() => (tool = 'caulk')}>
+					Caulk
+				</button>
+				<button class="chip" class:sel={tool === 'sticker'} onclick={() => (tool = 'sticker')}>
+					Stickers
+				</button>
+				{#if strokeCost > 0}<span class="chip cost">−{strokeCost} cm³</span>{/if}
+			</div>
+
+			{#if tool === 'caulk'}
+				<div class="thickness">
+					{#each ['thin', 'medium', 'thick'] as const as t}
+						<button class="thick-btn" class:active={thickness === t} onclick={() => (thickness = t)}>
+							<span class="dot {t}"></span>
+							{t}
+						</button>
+					{/each}
+				</div>
+				<p class="tip">
+					{phase === 'locked' ? 'Hold & drag on the wall to spray' : 'Lock onto the wall first'}
+				</p>
+			{:else}
 				<div class="picker">
 					{#each LIBRARY as item (item.id)}
 						<button
 							class="swatch"
 							class:active={selectedItem.id === item.id}
-							onclick={() => (selectedItem = item)}>{item.preview}</button
+							onclick={() => (selectedItem = item)}>{item.label}</button
 						>
 					{/each}
 				</div>
-				<div class="place-row">
-					<div class="sizes">
-						{#each ['s', 'm', 'l'] as const as size}
-							<button
-								class="swatch size"
-								class:active={selectedSize === size}
-								onclick={() => (selectedSize = size)}
-							>
-								{size.toUpperCase()}<small>{SIZE_COST[size]}</small>
-							</button>
-						{/each}
-					</div>
-					<button class="place ghost" onclick={() => (placeMode = false)}>cancel</button>
+				<div class="sizes">
+					{#each ['s', 'm', 'l'] as const as size}
+						<button
+							class="swatch size"
+							class:active={selectedSize === size}
+							onclick={() => (selectedSize = size)}
+						>
+							{size.toUpperCase()}<small>{SIZE_COST[size]}</small>
+						</button>
+					{/each}
 				</div>
 				<p class="tip">Tap the wall to place{placing ? '…' : ''}</p>
-			{:else}
-				<button class="place" onclick={() => (placeMode = true)} disabled={phase !== 'locked'}>
-					🎨 TAG THIS WALL
-				</button>
 			{/if}
 		</div>
 	{/if}
@@ -298,7 +461,7 @@
 					<span class="meta">appraised ✓</span>
 				{:else}
 					<button class="appraise" onclick={() => selectedTag && appraise(selectedTag)}>
-						👍 Appraise (+25 cm³)
+						Appraise (+25 cm³)
 					</button>
 				{/if}
 			</div>
@@ -402,7 +565,9 @@
 		border-radius: 0.8rem;
 		min-width: 3rem;
 		height: 3rem;
-		font-size: 1.4rem;
+		font-size: 0.8rem;
+		font-weight: 700;
+		letter-spacing: 0.04em;
 		display: flex;
 		flex-direction: column;
 		align-items: center;
@@ -422,34 +587,61 @@
 		font-size: 0.6rem;
 		color: var(--muted);
 	}
-	.place-row {
-		display: flex;
-		gap: 0.5rem;
-		align-items: center;
-	}
 	.sizes {
 		display: flex;
 		gap: 0.4rem;
 	}
-	.place {
+	.tools {
+		display: flex;
+		gap: 0.5rem;
+		align-items: center;
+	}
+	.chip.sel {
+		border-color: var(--accent);
+		box-shadow: 0 0 0 1px var(--accent);
+	}
+	.chip.cost {
+		color: #fbbf24;
+		margin-left: auto;
+	}
+	.thickness {
+		display: flex;
+		gap: 0.5rem;
+	}
+	.thick-btn {
 		flex: 1;
-		background: linear-gradient(90deg, var(--accent), var(--accent-2));
-		border: none;
-		border-radius: 1rem;
-		color: #0b0b0f;
-		font-weight: 800;
-		font-size: 1.05rem;
-		padding: 0.9rem;
-	}
-	.place:disabled {
-		opacity: 0.5;
-	}
-	.place.ghost {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 0.35rem;
 		background: rgba(11, 11, 15, 0.75);
-		color: var(--muted);
-		border: 1px solid rgba(255, 255, 255, 0.2);
-		flex: 0 0 auto;
-		padding: 0.9rem 1.2rem;
+		border: 1px solid rgba(255, 255, 255, 0.15);
+		border-radius: 0.9rem;
+		color: var(--text);
+		padding: 0.6rem;
+		font-size: 0.85rem;
+		text-transform: capitalize;
+	}
+	.thick-btn.active {
+		background: rgba(123, 97, 255, 0.35);
+		border-color: var(--accent);
+	}
+	.dot {
+		background: #fff;
+		border-radius: 999px;
+	}
+	.dot.thin {
+		width: 0.4rem;
+		height: 0.4rem;
+	}
+	.dot.medium {
+		width: 1.6rem;
+		height: 0.5rem;
+		background: #7b61ff;
+	}
+	.dot.thick {
+		width: 2.4rem;
+		height: 0.6rem;
 	}
 	.tip {
 		color: var(--text);

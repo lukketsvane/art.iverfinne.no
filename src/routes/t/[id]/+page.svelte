@@ -49,7 +49,7 @@
 		<p class="muted">Couldn't load the tag — check your connection and reload.</p>
 	{:else if tag}
 		<div class="card">
-			<div class="preview">{item?.preview ?? '🎨'}</div>
+			<div class="preview">{item?.label ?? (tag.model_url === 'caulk' ? 'CAULK' : 'ART')}</div>
 			<div>
 				<h2>{item?.name ?? tag.model_url.replace('builtin:', '')}</h2>
 				<p class="muted">
@@ -96,7 +96,10 @@
 		align-items: center;
 	}
 	.preview {
-		font-size: 3rem;
+		font-size: 1.2rem;
+		font-weight: 800;
+		letter-spacing: 0.06em;
+		color: var(--accent-2);
 	}
 	h2 {
 		margin: 0 0 0.25rem;

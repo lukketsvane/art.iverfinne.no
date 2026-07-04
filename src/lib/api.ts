@@ -134,6 +134,37 @@ export async function spotTags(spotId: string): Promise<SpotTag[]> {
 	return ((data ?? []) as SpotTag[]).map((t) => ({ ...t, appraised: Boolean(t.appraised) }));
 }
 
+export async function placeCaulk(args: {
+	spotId: string;
+	lat: number;
+	lon: number;
+	accuracy: number | null;
+	points: Array<[number, number]>;
+	radius: number;
+}): Promise<{ id: string; creator_id: string; volume_cm3: number; created_at: string }> {
+	const { data, error } = await supabase().rpc('place_caulk', {
+		p_spot_id: args.spotId,
+		p_lat: args.lat,
+		p_lon: args.lon,
+		p_accuracy: args.accuracy,
+		p_points: args.points,
+		p_radius: args.radius
+	});
+	if (error) throw error;
+	return data as { id: string; creator_id: string; volume_cm3: number; created_at: string };
+}
+
+export async function myStats(): Promise<{ places: number; given: number; received: number }> {
+	const { data, error } = await supabase().rpc('my_stats');
+	if (error) throw error;
+	const row = Array.isArray(data) ? data[0] : data;
+	return (row ?? { places: 0, given: 0, received: 0 }) as {
+		places: number;
+		given: number;
+		received: number;
+	};
+}
+
 export function spotFileUrl(path: string): string {
 	return supabase().storage.from('spots').getPublicUrl(path).data.publicUrl;
 }
