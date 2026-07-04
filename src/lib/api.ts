@@ -131,7 +131,11 @@ export async function createSpot(args: {
 		p_target_path: args.targetPath
 	});
 	if (error) throw error;
-	return data as Spot;
+	// create_spot returns the raw table row: coordinates live in `geog` (WKB),
+	// not lat/lon columns. Restore them from the request so callers that
+	// forward spot.lat/lon (e.g. place_voxels) don't pass undefined —
+	// supabase-js drops undefined args and the RPC fails signature matching.
+	return { ...(data as Spot), lat: args.lat, lon: args.lon };
 }
 
 export async function spotTags(spotId: string): Promise<SpotTag[]> {
