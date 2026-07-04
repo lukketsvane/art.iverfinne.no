@@ -81,18 +81,18 @@
 			</div>
 		{/if}
 
-		<button class="cta" onclick={() => goto('/ar')} disabled={!profile}>
-			Open camera
+		<button class="cta" onclick={() => goto('/spray')} disabled={!profile}>
+			SPRAY
 		</button>
 
 		<button class="cta secondary" onclick={() => goto('/spots/new')} disabled={!profile}>
-			New spot — precision wall anchor
+			New spot — photograph a wall
 		</button>
 
 		<ul class="notes">
-			<li>Needs camera, location and motion access — grant all three when asked.</li>
-			<li>Tags stick to GPS positions: expect a few metres of drift. That's the MVP deal.</li>
-			<li>Tap a tag in the camera view to appraise it.</li>
+			<li>Needs camera and location access — grant both when asked.</li>
+			<li>SPRAY finds the nearest tagged wall with GPS, then locks on with the camera — centimetre-precise, shared by everyone.</li>
+			<li>Hold &amp; drag on a locked wall to spray caulk; tap a tag to appraise it.</li>
 		</ul>
 	{/if}
 </main>
