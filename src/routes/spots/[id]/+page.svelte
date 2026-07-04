@@ -5,6 +5,7 @@
 	import * as THREE from 'three';
 	import { ensureSession } from '$lib/supabase';
 	import { getSpot, spotTags, placeTag, placeCaulk, appraiseTag, spotFileUrl, getProfile } from '$lib/api';
+	import { distanceM } from '$lib/ar/session';
 	import { buildBuiltin, buildCaulk, caulkMaterial, LIBRARY } from '$lib/library';
 	import {
 		SIZE_COST,
@@ -29,6 +30,7 @@
 
 	let selectedItem = $state(LIBRARY[0]);
 	let selectedSize = $state<SizeClass>('m');
+	let spotDistance = $state<number | null>(null);
 
 	// Caulk tool — the mockups' "tag with caulk" flow.
 	type Thickness = 'thin' | 'medium' | 'thick';
@@ -314,6 +316,17 @@
 			}
 			tags = await spotTags(spot.id);
 
+			// Sensor guidance: how far is the wall?
+			navigator.geolocation?.getCurrentPosition(
+				(pos) => {
+					if (spot)
+						spotDistance = distanceM(
+							pos.coords.latitude, pos.coords.longitude, spot.lat, spot.lon);
+				},
+				() => {},
+				{ enableHighAccuracy: true, timeout: 8000 }
+			);
+
 			const { MindARThree } = await import('$lib/vendor/mindar/mindar-image-three.prod.js');
 			mindar = new MindARThree({
 				container,
@@ -373,7 +386,7 @@
 
 <div class="spot-root" bind:this={container}>
 	<div class="hud top">
-		<button class="chip" onclick={() => goto('/ar')}>‹ AR</button>
+		<button class="chip" onclick={() => goto('/')}>‹ home</button>
 		{#if profile}<span class="chip">{fmtVolume(remaining)}</span>{/if}
 		<span class="chip" class:locked={phase === 'locked'}>
 			{#if phase === 'loading'}loading…{:else if phase === 'scanning'}Point at the wall
@@ -392,7 +405,10 @@
 	{#if spot && phase === 'scanning'}
 		<div class="hint">
 			<img src={spotFileUrl(spot.image_path)} alt="find this wall" />
-			<p>Find this surface and point your camera at it</p>
+			<p>
+				Find this surface and point your camera at it{#if spotDistance !== null && spotDistance > 25}
+					· {spotDistance < 1000 ? `${spotDistance.toFixed(0)} m` : `${(spotDistance / 1000).toFixed(1)} km`} away{/if}
+			</p>
 		</div>
 	{/if}
 
