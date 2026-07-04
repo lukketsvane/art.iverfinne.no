@@ -3,7 +3,8 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { ensureSession } from '$lib/supabase';
-	import { getProfile, getTag, nearbyTags, placeTag, appraiseTag, reportTag } from '$lib/api';
+	import { getProfile, getTag, nearbyTags, nearbySpots, placeTag, appraiseTag, reportTag } from '$lib/api';
+	import type { Spot } from '$lib/types';
 	import { ArSession, offsetLatLon, distanceM, bearingDeg } from '$lib/ar/session';
 	import { LIBRARY } from '$lib/library';
 	import { SIZE_COST, type NearbyTag, type Profile, type SizeClass } from '$lib/types';
@@ -52,6 +53,8 @@
 		if (userId) profile = await getProfile(userId);
 	}
 
+	let nearestSpot = $state<Spot | null>(null);
+
 	async function fetchNearby(lat: number, lon: number) {
 		try {
 			lastFetchAt = { lat, lon };
@@ -59,6 +62,12 @@
 			session?.syncTags(tags);
 		} catch (e) {
 			console.error('nearby fetch failed', e);
+		}
+		try {
+			const spots = await nearbySpots(lat, lon, 300);
+			nearestSpot = spots[0] ?? null;
+		} catch {
+			nearestSpot = null; // migration 0003 not applied yet — fine
 		}
 	}
 
@@ -255,6 +264,12 @@
 
 	{#if phase === 'ready'}
 		<div class="hud bottom">
+			{#if nearestSpot}
+				<button class="spot-banner" onclick={() => goto(`/spots/${nearestSpot!.id}`)}>
+					🧱 {nearestSpot.name ?? 'Spot'} · {nearestSpot.distance_m?.toFixed(0)} m ·
+					{nearestSpot.tag_count} tags — <strong>precise mode</strong>
+				</button>
+			{/if}
 			<div class="picker">
 				{#each LIBRARY as item (item.id)}
 					<button
@@ -404,6 +419,15 @@
 		font-weight: 400;
 		font-size: 0.6rem;
 		color: var(--muted);
+	}
+	.spot-banner {
+		background: rgba(11, 11, 15, 0.8);
+		border: 1px solid var(--accent-2);
+		border-radius: 999px;
+		color: var(--text);
+		padding: 0.55rem 1rem;
+		font-size: 0.9rem;
+		backdrop-filter: blur(8px);
 	}
 	.place-row {
 		display: flex;
