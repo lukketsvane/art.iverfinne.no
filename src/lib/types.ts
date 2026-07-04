@@ -65,6 +65,19 @@ export function fmtVolume(cm3: number): string {
 	return cm3 >= 10000 ? `${(cm3 / 1000).toFixed(0)} L` : `${cm3.toFixed(0)} cm³`;
 }
 
+/** ART: the app's volume currency. One ART = 100 L of caulk. */
+export const CM3_PER_ART = 100000;
+export const USD_PER_ART = 0.67; // display-only novelty rate
+
+export function toArt(cm3: number): number {
+	return cm3 / CM3_PER_ART;
+}
+
+export function fmtArt(cm3: number): string {
+	const art = toArt(cm3);
+	return art >= 100 ? art.toFixed(0) : art.toFixed(2);
+}
+
 export interface PlacementPose {
 	lat: number;
 	lon: number;

@@ -70,12 +70,13 @@ function sprayTagTexture(): THREE.Texture {
 export const CAULK_COLOR = 0xf4f4f6;
 
 export function caulkMaterial(): THREE.Material {
+	// Matte-ish foam: hard specular pings on a soft camera feed read as CG.
 	return new THREE.MeshPhysicalMaterial({
 		color: CAULK_COLOR,
-		roughness: 0.18,
-		metalness: 0.02,
-		clearcoat: 0.7,
-		clearcoatRoughness: 0.25
+		roughness: 0.34,
+		metalness: 0.0,
+		clearcoat: 0.35,
+		clearcoatRoughness: 0.45
 	});
 }
 
