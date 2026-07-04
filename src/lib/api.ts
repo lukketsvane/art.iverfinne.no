@@ -1,5 +1,13 @@
 import { supabase } from '$lib/supabase';
-import type { NearbyTag, PlacementPose, Profile, SizeClass } from '$lib/types';
+import type {
+	NearbyTag,
+	PlacementPose,
+	Profile,
+	SizeClass,
+	Spot,
+	SpotTag,
+	SpotXY
+} from '$lib/types';
 
 export async function getProfile(userId: string): Promise<Profile> {
 	const { data, error } = await supabase()
@@ -24,7 +32,8 @@ export async function nearbyTags(lat: number, lon: number, radiusM = 150): Promi
 export async function placeTag(
 	pose: PlacementPose,
 	modelUrl: string,
-	sizeClass: SizeClass
+	sizeClass: SizeClass,
+	spot?: { id: string; xy: SpotXY }
 ): Promise<NearbyTag> {
 	const { data, error } = await supabase().rpc('place_tag', {
 		p_lat: pose.lat,
@@ -34,7 +43,9 @@ export async function placeTag(
 		p_accuracy: pose.accuracy,
 		p_model_url: modelUrl,
 		p_size_class: sizeClass,
-		p_device: { ua: navigator.userAgent, placed_via: 'sensor-ar-web-mvp' }
+		p_device: { ua: navigator.userAgent, placed_via: spot ? 'spot-web-mvp' : 'sensor-ar-web-mvp' },
+		p_spot_id: spot?.id ?? null,
+		p_spot_xy: spot?.xy ?? null
 	});
 	if (error) throw error;
 	// place_tag returns a tags row; adapt it to the NearbyTag shape for the scene.
@@ -75,5 +86,61 @@ export async function appraiseTag(tagId: string): Promise<void> {
 
 export async function reportTag(tagId: string, reason?: string): Promise<void> {
 	const { error } = await supabase().rpc('report_tag', { p_tag_id: tagId, p_reason: reason ?? null });
+	if (error) throw error;
+}
+
+// ---- Spots (wall-photo precision anchors) ----
+
+export async function nearbySpots(lat: number, lon: number, radiusM = 300): Promise<Spot[]> {
+	const { data, error } = await supabase().rpc('nearby_spots', {
+		p_lat: lat,
+		p_lon: lon,
+		p_radius_m: radiusM
+	});
+	if (error) throw error;
+	return (data ?? []) as Spot[];
+}
+
+export async function getSpot(spotId: string): Promise<Spot | null> {
+	const { data, error } = await supabase().rpc('get_spot', { p_spot_id: spotId });
+	if (error) throw error;
+	const row = Array.isArray(data) ? data[0] : data;
+	return (row ?? null) as Spot | null;
+}
+
+export async function createSpot(args: {
+	lat: number;
+	lon: number;
+	accuracy: number | null;
+	name: string | null;
+	imagePath: string;
+	targetPath: string;
+}): Promise<Spot> {
+	const { data, error } = await supabase().rpc('create_spot', {
+		p_lat: args.lat,
+		p_lon: args.lon,
+		p_accuracy: args.accuracy,
+		p_name: args.name,
+		p_image_path: args.imagePath,
+		p_target_path: args.targetPath
+	});
+	if (error) throw error;
+	return data as Spot;
+}
+
+export async function spotTags(spotId: string): Promise<SpotTag[]> {
+	const { data, error } = await supabase().rpc('spot_tags', { p_spot_id: spotId });
+	if (error) throw error;
+	return ((data ?? []) as SpotTag[]).map((t) => ({ ...t, appraised: Boolean(t.appraised) }));
+}
+
+export function spotFileUrl(path: string): string {
+	return supabase().storage.from('spots').getPublicUrl(path).data.publicUrl;
+}
+
+export async function uploadSpotFile(path: string, body: Blob, contentType: string): Promise<void> {
+	const { error } = await supabase()
+		.storage.from('spots')
+		.upload(path, body, { contentType, upsert: false });
 	if (error) throw error;
 }
