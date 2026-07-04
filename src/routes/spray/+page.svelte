@@ -5,7 +5,7 @@
 	import * as THREE from 'three';
 	import { ensureSession } from '$lib/supabase';
 	import { nearbySpots, createSpot, placeCaulk, getProfile } from '$lib/api';
-	import { compileWallTarget, uploadSpotAssets, collectAveragedFix } from '$lib/spots';
+	import { compileWallTarget, uploadSpotAssets, collectAveragedFix, downscaleJpeg } from '$lib/spots';
 	import { caulkMaterial, caulkJitter, buildCaulk } from '$lib/library';
 	import { fmtVolume, type Profile } from '$lib/types';
 
@@ -16,12 +16,12 @@
 	let overlay: HTMLCanvasElement;
 	let stream: MediaStream | null = null;
 
-	let phase = $state<'boot' | 'live' | 'drawing' | 'saving' | 'error'>('boot');
+	let phase = $state<'boot' | 'live' | 'drawing' | 'error'>('boot');
+	let bg = $state<{ label: string; pct: number } | null>(null);
+	let savedSpotId = $state<string | null>(null);
 	let thickness = $state<Thickness>('medium');
 	let depthCm = $state(3); // stand-off from the wall, in image-percent 'cm'
 	let errorMsg = $state('');
-	let saveLabel = $state('');
-	let progress = $state(0);
 	let strokeCount = $state(0);
 	let pendingCost = $state(0);
 	let profile = $state<Profile | null>(null);
@@ -308,23 +308,33 @@
 		phase = 'live';
 	}
 
-	/** Background: wall → anchor → spot → strokes. User just watches a pill. */
+	/**
+	 * Fully background: hand the wall + strokes to an async pipeline and put
+	 * the user straight back into live drawing. The mesh visual builds over
+	 * the artwork while it anchors; a chip appears when the wall is set.
+	 */
 	async function save() {
-		if (!frame || strokes.length === 0 || phase === 'saving') return;
-		phase = 'saving';
+		if (!frame || strokes.length === 0 || bg) return;
+		const job = { frame, strokes: [...strokes], groups: [...strokeGroups] };
+		frame = null;
+		strokes = [];
+		strokeGroups = [];
+		strokeCount = 0;
+		pendingCost = 0;
+		phase = 'live';
+		bg = { label: 'ANCHORING', pct: 0 };
 		try {
-			saveLabel = 'Anchoring';
-			progress = 0;
+			// Compile from an 800px version: 3-4x faster, plenty for tracking.
+			const compileInput = await downscaleJpeg(job.frame, 800);
 			showMesh();
-			const target = await compileWallTarget(frame, (p) => {
-				progress = p;
+			const target = await compileWallTarget(compileInput, (p) => {
+				bg = { label: 'ANCHORING', pct: p };
 				updateMesh(p);
 			});
-			updateMesh(100);
-
-			saveLabel = 'Saving';
+			hideMesh();
+			bg = { label: 'SAVING', pct: 100 };
 			gps = (await collectAveragedFix(1)) ?? gps;
-			const { imagePath, targetPath } = await uploadSpotAssets(frame, target);
+			const { imagePath, targetPath } = await uploadSpotAssets(job.frame, target);
 			const spot = await createSpot({
 				lat: gps?.lat ?? 0,
 				lon: gps?.lon ?? 0,
@@ -333,29 +343,41 @@
 				imagePath,
 				targetPath
 			});
-			for (const s of strokes) {
+			for (const st of job.strokes) {
 				await placeCaulk({
 					spotId: spot.id,
 					lat: spot.lat,
 					lon: spot.lon,
 					accuracy: gps?.accuracy ?? null,
-					points: s.points,
-					radius: s.r,
-					depth: s.z
+					points: st.points,
+					radius: st.r,
+					depth: st.z
 				});
 			}
-			stopEverything();
-			await goto(`/spots/${spot.id}`, { replaceState: true });
+			// Persisted — the screen-fixed copies have done their job.
+			for (const g of job.groups) g.parent?.remove(g);
+			bg = null;
+			savedSpotId = spot.id;
+			if (profile) profile = await getProfile(profile.id);
 		} catch (e) {
 			hideMesh();
-			phase = 'drawing';
+			bg = null;
+			// Give the strokes back so nothing is lost.
+			if (frame === null && strokes.length === 0) {
+				frame = job.frame;
+				strokes = job.strokes;
+				strokeGroups = job.groups;
+				strokeCount = strokes.length;
+				pendingCost = strokes.reduce((a, st) => a + strokeCost(st.points, st.r), 0);
+				phase = 'drawing';
+			}
 			errorMsg = e instanceof Error ? e.message : String(e);
-			setTimeout(() => (errorMsg = ''), 4000);
+			setTimeout(() => (errorMsg = ''), 5000);
 		}
 	}
 
 	function holdStart() {
-		if (phase !== 'drawing' || strokeCount === 0) return;
+		if (phase !== 'drawing' || strokeCount === 0 || bg) return;
 		holding = true;
 		holdTimer = setTimeout(() => {
 			holding = false;
@@ -393,17 +415,20 @@
 	<div class="hud top">
 		<button class="chip" onclick={() => goto('/')}>‹</button>
 		<span class="chip status">
-			{#if phase === 'boot'}Starting…{:else if phase === 'live'}NEW WALL — just draw
-			{:else if phase === 'drawing'}EXTRUDING 3D · {costPct > 0 && costPct < 1 ? '<1' : costPct.toFixed(0)}%
-			{:else if phase === 'saving'}{saveLabel === 'Anchoring' ? `BUILDING 3D MESH · ${progress.toFixed(0)}%` : `${saveLabel}…`}{/if}
+			{#if phase === 'boot'}Starting…{:else if phase === 'drawing'}EXTRUDING 3D · {costPct > 0 && costPct < 1 ? '<1' : costPct.toFixed(0)}%
+			{:else if bg}{bg.label} · {bg.pct.toFixed(0)}%
+			{:else}NEW WALL — just draw{/if}
 		</span>
+		{#if savedSpotId && !bg}
+			<button class="chip set-chip" onclick={() => goto(`/spots/${savedSpotId}`)}>Wall set ✓</button>
+		{/if}
 		{#if phase === 'drawing'}
 			<button class="chip" onclick={undo}>undo</button>
 			<button class="chip" onclick={discard}>✕</button>
 		{/if}
 	</div>
 
-	{#if profile && (phase === 'live' || phase === 'drawing' || phase === 'saving')}
+	{#if profile && (phase === 'live' || phase === 'drawing')}
 		<div class="meter" aria-hidden="true">
 			<span class="meter-label">VOLUME</span>
 			<div class="meter-bar"><div class="meter-fill" style="height: {meterPct}%"></div></div>
@@ -511,6 +536,10 @@
 		padding: 0.4rem 0.9rem;
 		font-size: 0.85rem;
 		backdrop-filter: blur(8px);
+	}
+	.chip.set-chip {
+		border-color: #4ade80;
+		color: #4ade80;
 	}
 	.chip.status {
 		flex: 1;

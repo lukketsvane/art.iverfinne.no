@@ -17,10 +17,9 @@ export async function compileWallTarget(
 	return new Blob([data], { type: 'application/octet-stream' });
 }
 
-/** Downscale the photo (long edge ≤1280) — plenty for tracking, fast to compile. */
-export async function normalizePhoto(file: File): Promise<Blob> {
+/** Downscale a photo blob to a max long edge, re-encoded as JPEG. */
+export async function downscaleJpeg(file: File | Blob, maxEdge: number): Promise<Blob> {
 	const img = await loadImage(file);
-	const maxEdge = 1280;
 	const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
 	const canvas = document.createElement('canvas');
 	canvas.width = Math.round(img.width * scale);
@@ -29,6 +28,11 @@ export async function normalizePhoto(file: File): Promise<Blob> {
 	return await new Promise((resolve, reject) =>
 		canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('jpeg encode failed'))), 'image/jpeg', 0.85)
 	);
+}
+
+/** Legacy name: photo normalization for spot creation. */
+export async function normalizePhoto(file: File): Promise<Blob> {
+	return downscaleJpeg(file, 1280);
 }
 
 export async function uploadSpotAssets(
