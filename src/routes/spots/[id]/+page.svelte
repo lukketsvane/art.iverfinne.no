@@ -49,9 +49,9 @@
 	function addTagMesh(tag: SpotTag) {
 		if (!anchorGroup || tagObjects.has(tag.id) || !tag.spot_xy) return;
 		let obj: THREE.Object3D | null = null;
-		const xy = tag.spot_xy as { x?: number; y?: number; s?: number; points?: Array<[number, number]>; r?: number };
+		const xy = tag.spot_xy as { x?: number; y?: number; s?: number; points?: Array<[number, number]>; r?: number; z?: number };
 		if (tag.model_url === 'caulk' && xy.points && xy.r) {
-			obj = buildCaulk(xy.points, xy.r);
+			obj = buildCaulk(xy.points, xy.r, xy.z);
 		} else {
 			const builtinId = tag.model_url.startsWith('builtin:') ? tag.model_url.slice(8) : null;
 			obj = builtinId ? buildBuiltin(builtinId, tag.size_class) : null;
@@ -156,18 +156,15 @@
 				creator_id: placed.creator_id,
 				model_url: 'caulk',
 				size_class: thickness === 'thin' ? 's' : thickness === 'thick' ? 'l' : 'm',
-				spot_xy: { points, r } as never,
+				spot_xy: { points, r, z: r * 0.6 } as never,
 				appraisals: 0,
 				appraised: false,
 				created_at: placed.created_at
 			};
-			// The live preview already looks right — adopt it as the tag mesh.
-			if (preview) {
-				preview.userData.tagId = placed.id;
-				preview.traverse((c) => (c.userData.tagId = placed.id));
-				tagObjects.set(placed.id, preview);
-			}
+			// Swap the bead preview for the smooth tube render.
+			preview?.parent?.remove(preview);
 			tags = [...tags, spotTag];
+			addTagMesh(spotTag);
 			await refreshProfile();
 			showToast(`Sprayed! −${placed.volume_cm3.toFixed(0)} cm³`);
 		} catch (e) {
@@ -203,6 +200,11 @@
 	}
 
 	function handlePointerDown(ev: PointerEvent) {
+		if (phase === 'scanning') {
+			// Different wall than this spot? Just draw — a new wall is born.
+			void goto('/spray?new=1');
+			return;
+		}
 		onPointerDown(ev);
 	}
 
@@ -362,7 +364,9 @@
 				{/each}
 			</div>
 			<p class="tip">
-				{phase === 'locked' ? 'Hold & drag on the wall to spray' : 'Locking onto the wall…'}
+				{phase === 'locked'
+					? 'Hold & drag on the wall to spray'
+					: 'Locking… · tap anywhere to spray THIS wall instead'}
 			</p>
 		</div>
 	{/if}

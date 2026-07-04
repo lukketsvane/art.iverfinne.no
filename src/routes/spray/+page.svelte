@@ -1,11 +1,13 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import * as THREE from 'three';
 	import { ensureSession } from '$lib/supabase';
-	import { nearbySpots, createSpot, placeCaulk } from '$lib/api';
+	import { nearbySpots, createSpot, placeCaulk, getProfile } from '$lib/api';
 	import { compileWallTarget, uploadSpotAssets, collectAveragedFix } from '$lib/spots';
-	import { caulkMaterial } from '$lib/library';
+	import { caulkMaterial, caulkJitter, buildCaulk } from '$lib/library';
+	import { fmtVolume, type Profile } from '$lib/types';
 
 	type Thickness = 'thin' | 'medium' | 'thick';
 	const CAULK_RADIUS: Record<Thickness, number> = { thin: 0.015, medium: 0.03, thick: 0.05 };
@@ -16,17 +18,30 @@
 
 	let phase = $state<'boot' | 'live' | 'drawing' | 'saving' | 'error'>('boot');
 	let thickness = $state<Thickness>('medium');
+	let depthCm = $state(3); // stand-off from the wall, in image-percent 'cm'
 	let errorMsg = $state('');
 	let saveLabel = $state('');
 	let progress = $state(0);
 	let strokeCount = $state(0);
+	let pendingCost = $state(0);
+	let profile = $state<Profile | null>(null);
+	let holding = $state(false);
 	let gps = $state<{ lat: number; lon: number; accuracy: number } | null>(null);
+	let holdTimer: ReturnType<typeof setTimeout> | undefined;
+
+	const remaining = $derived(profile ? profile.total_volume - profile.used_volume : 0);
+	const meterPct = $derived(
+		profile && profile.total_volume > 0
+			? Math.max(0, Math.min(100, ((remaining - pendingCost) / profile.total_volume) * 100))
+			: 0
+	);
+	const costPct = $derived(remaining > 0 ? Math.min(100, (pendingCost / remaining) * 100) : 0);
 
 	// Frozen-frame drawing state
 	let frame: Blob | null = null;
 	let frameW = 0;
 	let frameH = 0;
-	let strokes: Array<{ points: Array<[number, number]>; r: number }> = [];
+	let strokes: Array<{ points: Array<[number, number]>; r: number; z: number }> = [];
 	let current: Array<[number, number]> | null = null;
 
 	// three.js screen-space overlay (glossy caulk look without tracking)
@@ -35,10 +50,12 @@
 	let camera: THREE.OrthographicCamera | null = null;
 	let strokeGroups: THREE.Group[] = [];
 	let currentGroup: THREE.Group | null = null;
+	let blobIndex = 0;
 
 	onMount(async () => {
 		try {
-			await ensureSession();
+			const userId = await ensureSession();
+			void getProfile(userId).then((p) => (profile = p));
 			const [mediaStream, fix] = await Promise.all([
 				navigator.mediaDevices.getUserMedia({
 					video: { facingMode: 'environment', width: { ideal: 1920 } }
@@ -48,7 +65,8 @@
 			gps = fix;
 
 			// Auto-access: if a tracked wall is nearby, use it — invisible redirect.
-			if (fix) {
+			// ?new=1 skips this (came here to spray a DIFFERENT wall).
+			if (fix && !page.url.searchParams.get('new')) {
 				try {
 					const spots = await nearbySpots(fix.lat, fix.lon, 500);
 					if (spots.length > 0) {
@@ -135,6 +153,7 @@
 		const rPx = screenRadius(CAULK_RADIUS[thickness]);
 		const blob = new THREE.Mesh(new THREE.SphereGeometry(rPx, 20, 14), caulkMaterial());
 		blob.position.set(px - window.innerWidth / 2, window.innerHeight / 2 - py, 0);
+		blob.scale.setScalar(caulkJitter(blobIndex++));
 		currentGroup.add(blob);
 	}
 
@@ -164,12 +183,27 @@
 		addBlob(ev.clientX, ev.clientY);
 	}
 
+	function strokeCost(points: Array<[number, number]>, r: number): number {
+		let len = 0;
+		for (let i = 1; i < points.length; i++)
+			len += Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]);
+		return Math.max(10, Math.round(Math.PI * r * r * len * 1e5));
+	}
+
 	function onUp() {
 		if (!current) return;
-		if (current.length >= 2 && currentGroup) {
-			strokes.push({ points: current, r: CAULK_RADIUS[thickness] });
-			strokeGroups.push(currentGroup);
+		if (current.length >= 2 && currentGroup && scene) {
+			const r = CAULK_RADIUS[thickness];
+			const z = depthCm / 100;
+			// Swap the live bead preview for the smooth glossy tube (mock look).
+			currentGroup.parent?.remove(currentGroup);
+			const tube = buildCaulk(current, r, z);
+			tube.scale.setScalar(coverMap().dispW);
+			scene.add(tube);
+			strokes.push({ points: current, r, z });
+			strokeGroups.push(tube);
 			strokeCount = strokes.length;
+			pendingCost += strokeCost(current, r);
 		} else {
 			currentGroup?.parent?.remove(currentGroup);
 		}
@@ -180,7 +214,8 @@
 	function undo() {
 		const g = strokeGroups.pop();
 		g?.parent?.remove(g);
-		strokes.pop();
+		const st = strokes.pop();
+		if (st) pendingCost = Math.max(0, pendingCost - strokeCost(st.points, st.r));
 		strokeCount = strokes.length;
 		if (strokes.length === 0) resumeLive();
 	}
@@ -190,6 +225,7 @@
 		strokeGroups = [];
 		strokes = [];
 		strokeCount = 0;
+		pendingCost = 0;
 		resumeLive();
 	}
 
@@ -226,7 +262,8 @@
 					lon: spot.lon,
 					accuracy: gps?.accuracy ?? null,
 					points: s.points,
-					radius: s.r
+					radius: s.r,
+					depth: s.z
 				});
 			}
 			stopEverything();
@@ -238,7 +275,22 @@
 		}
 	}
 
+	function holdStart() {
+		if (phase !== 'drawing' || strokeCount === 0) return;
+		holding = true;
+		holdTimer = setTimeout(() => {
+			holding = false;
+			void save();
+		}, 700);
+	}
+
+	function holdEnd() {
+		holding = false;
+		clearTimeout(holdTimer);
+	}
+
 	function stopEverything() {
+		clearTimeout(holdTimer);
 		renderer?.setAnimationLoop(null);
 		renderer?.dispose();
 		stream?.getTracks().forEach((t) => t.stop());
@@ -263,7 +315,7 @@
 		<button class="chip" onclick={() => goto('/')}>‹</button>
 		<span class="chip status">
 			{#if phase === 'boot'}Starting…{:else if phase === 'live'}NEW WALL — just draw
-			{:else if phase === 'drawing'}{strokeCount} stroke{strokeCount === 1 ? '' : 's'}
+			{:else if phase === 'drawing'}EXTRUDING 3D · {costPct.toFixed(0)}%
 			{:else if phase === 'saving'}{saveLabel} {saveLabel === 'Anchoring' ? `${progress.toFixed(0)}%` : '…'}{/if}
 		</span>
 		{#if phase === 'drawing'}
@@ -272,8 +324,23 @@
 		{/if}
 	</div>
 
+	{#if profile && (phase === 'live' || phase === 'drawing' || phase === 'saving')}
+		<div class="meter" aria-hidden="true">
+			<span class="meter-label">VOLUME</span>
+			<div class="meter-bar"><div class="meter-fill" style="height: {meterPct}%"></div></div>
+			<span class="meter-pct">{meterPct.toFixed(0)}%</span>
+		</div>
+	{/if}
+
 	{#if phase === 'live' || phase === 'drawing'}
 		<div class="hud bottom">
+			{#if phase === 'drawing' || phase === 'live'}
+				<label class="depth">
+					<span class="panel-label">DEPTH</span>
+					<input type="range" min="-5" max="15" step="1" bind:value={depthCm} />
+					<span class="depth-val">{depthCm} cm</span>
+				</label>
+			{/if}
 			<div class="thickness">
 				{#each ['thin', 'medium', 'thick'] as const as t}
 					<button class="thick-btn" class:active={thickness === t} onclick={() => (thickness = t)}>
@@ -283,7 +350,28 @@
 				{/each}
 			</div>
 			{#if phase === 'drawing' && strokeCount > 0}
-				<button class="cta" onclick={save}>SET IT</button>
+				<div class="panel">
+					<div class="panel-col">
+						<span class="panel-label">VOLUME COST</span>
+						<span class="panel-big">{costPct.toFixed(0)}%</span>
+						<span class="panel-sub">−{fmtVolume(pendingCost)}</span>
+					</div>
+					<div class="panel-col">
+						<span class="panel-label">BALANCE</span>
+						<span class="panel-big">{fmtVolume(remaining)}</span>
+						<span class="panel-sub">{strokeCount} stroke{strokeCount === 1 ? '' : 's'}</span>
+					</div>
+					<button
+						class="hold-btn"
+						class:holding
+						onpointerdown={holdStart}
+						onpointerup={holdEnd}
+						onpointerleave={holdEnd}
+					>
+						<span class="hold-fill"></span>
+						<span class="hold-text">Place 3D tag<small>HOLD TO CONFIRM</small></span>
+					</button>
+				</div>
 			{/if}
 			{#if errorMsg}<p class="err">{errorMsg}</p>{/if}
 		</div>
@@ -395,6 +483,126 @@
 		border: none;
 		border-radius: 1rem;
 		padding: 1.1rem;
+	}
+	.meter {
+		position: absolute;
+		left: 0.9rem;
+		top: 50%;
+		transform: translateY(-38%);
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 0.4rem;
+		z-index: 8;
+		pointer-events: none;
+	}
+	.meter-label {
+		font-size: 0.6rem;
+		letter-spacing: 0.12em;
+		color: var(--text);
+		text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
+	}
+	.meter-bar {
+		width: 0.85rem;
+		height: 7.5rem;
+		border-radius: 999px;
+		background: rgba(11, 11, 15, 0.55);
+		border: 1px solid rgba(255, 255, 255, 0.25);
+		overflow: hidden;
+		display: flex;
+		align-items: flex-end;
+	}
+	.meter-fill {
+		width: 100%;
+		background: linear-gradient(180deg, var(--accent-2), var(--accent));
+		transition: height 0.3s ease;
+	}
+	.meter-pct {
+		font-size: 0.75rem;
+		font-weight: 700;
+		color: var(--text);
+		text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
+	}
+	.depth {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		background: rgba(11, 11, 15, 0.7);
+		border-radius: 999px;
+		padding: 0.35rem 0.9rem;
+	}
+	.depth input {
+		flex: 1;
+		accent-color: var(--accent);
+	}
+	.depth-val {
+		font-size: 0.78rem;
+		font-weight: 700;
+		min-width: 3.2rem;
+		text-align: right;
+	}
+	.panel {
+		display: flex;
+		align-items: stretch;
+		gap: 0.9rem;
+		background: rgba(11, 11, 15, 0.8);
+		border: 1px solid rgba(255, 255, 255, 0.12);
+		border-radius: 1.1rem;
+		padding: 0.8rem 1rem;
+		backdrop-filter: blur(10px);
+	}
+	.panel-col {
+		display: flex;
+		flex-direction: column;
+		gap: 0.1rem;
+		justify-content: center;
+	}
+	.panel-label {
+		font-size: 0.6rem;
+		letter-spacing: 0.1em;
+		color: var(--muted);
+	}
+	.panel-big {
+		font-size: 1.25rem;
+		font-weight: 800;
+	}
+	.panel-sub {
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.hold-btn {
+		position: relative;
+		flex: 1;
+		border: none;
+		border-radius: 0.9rem;
+		background: linear-gradient(90deg, var(--accent), var(--accent-2));
+		color: #fff;
+		overflow: hidden;
+		padding: 0.7rem 1rem;
+	}
+	.hold-fill {
+		position: absolute;
+		inset: 0;
+		background: rgba(255, 255, 255, 0.35);
+		transform: scaleX(0);
+		transform-origin: left;
+	}
+	.hold-btn.holding .hold-fill {
+		transition: transform 0.7s linear;
+		transform: scaleX(1);
+	}
+	.hold-text {
+		position: relative;
+		display: flex;
+		flex-direction: column;
+		font-weight: 800;
+		font-size: 1rem;
+	}
+	.hold-text small {
+		font-weight: 500;
+		font-size: 0.6rem;
+		letter-spacing: 0.12em;
+		opacity: 0.85;
 	}
 	.center {
 		position: absolute;

@@ -141,15 +141,21 @@ export async function placeCaulk(args: {
 	accuracy: number | null;
 	points: Array<[number, number]>;
 	radius: number;
+	depth?: number;
 }): Promise<{ id: string; creator_id: string; volume_cm3: number; created_at: string }> {
-	const { data, error } = await supabase().rpc('place_caulk', {
+	const base = {
 		p_spot_id: args.spotId,
 		p_lat: args.lat,
 		p_lon: args.lon,
 		p_accuracy: args.accuracy,
 		p_points: args.points,
 		p_radius: args.radius
-	});
+	};
+	let { data, error } = await supabase().rpc('place_caulk', { ...base, p_depth: args.depth ?? null });
+	if (error && /place_caulk/.test(error.message) && /not exist|schema cache/i.test(error.message)) {
+		// Migration 0007 not applied yet — retry with the 0005 signature.
+		({ data, error } = await supabase().rpc('place_caulk', base));
+	}
 	if (error) throw error;
 	return data as { id: string; creator_id: string; volume_cm3: number; created_at: string };
 }
