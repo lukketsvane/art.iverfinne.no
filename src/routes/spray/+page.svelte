@@ -7,7 +7,8 @@
 	import { nearbySpots, createSpot, placeVoxels, getProfile, errText } from '$lib/api';
 	import { VoxelBrush } from '$lib/voxel';
 	import { compileWallTarget, uploadSpotAssets, collectAveragedFix, downscaleJpeg } from '$lib/spots';
-	import { detectFeatures, triangulate, avgLuminance } from '$lib/mesh';
+	import { triangulate, avgLuminance, type Feature } from '$lib/mesh';
+	import { sampleFrame, burstSample, encodeSample, type FrameSample } from '$lib/wallmap';
 
 	import { fmtVolume, type Profile, type Spot } from '$lib/types';
 
@@ -33,10 +34,17 @@
 	let gps = $state<{ lat: number; lon: number; accuracy: number } | null>(null);
 
 	let frame: Blob | null = null; // 1280px reference photo
-	let frameW = 0;
-	let frameH = 0;
-	let detectData: ImageData | null = null; // small copy for feature detection
+	let detectData: ImageData | null = null; // small copy the CV ran on
 	let featureCount = $state(0);
+
+	// Scanner: live feature detection on the feed; best-scoring frame wins.
+	const MIN_FEATURES = 70;
+	const SCAN_TICK_MS = 350;
+	const SCAN_GIVE_UP_MS = 8000; // then take the best frame seen so far
+	let scanTimer: ReturnType<typeof setInterval> | undefined;
+	let scanStart = 0;
+	let goodStreak = 0;
+	let bestSample: FrameSample | null = null;
 
 	// The wall's DB row is created in the background; strokes await it.
 	let spotPromise: Promise<Spot> | null = null;
@@ -112,10 +120,10 @@
 				});
 			}
 
-			// Automatic: a beat to aim/expose, then the wall is captured and mapped.
-			setTimeout(() => {
-				if (phase === 'aim') void buildMap();
-			}, 1300);
+			// Live scan: features draw on the feed as they're detected; capture
+			// fires once the wall shows enough trackable detail (or times out
+			// onto the best frame seen).
+			startScanning();
 		} catch (e) {
 			phase = 'error';
 			const err = e as { name?: string };
@@ -128,36 +136,42 @@
 		}
 	});
 
-	async function captureFrame(src: HTMLVideoElement): Promise<Blob> {
-		const maxEdge = 1280;
-		const scale = Math.min(1, maxEdge / Math.max(src.videoWidth, src.videoHeight));
-		const canvas = document.createElement('canvas');
-		canvas.width = Math.round(src.videoWidth * scale);
-		canvas.height = Math.round(src.videoHeight * scale);
-		canvas.getContext('2d')!.drawImage(src, 0, 0, canvas.width, canvas.height);
-		frameW = canvas.width;
-		frameH = canvas.height;
-		// Small grayscale-ready copy for the real feature-detection overlay
-		const dScale = 420 / Math.max(canvas.width, canvas.height);
-		const dc = document.createElement('canvas');
-		dc.width = Math.max(2, Math.round(canvas.width * dScale));
-		dc.height = Math.max(2, Math.round(canvas.height * dScale));
-		const dctx = dc.getContext('2d', { willReadFrequently: true })!;
-		dctx.drawImage(canvas, 0, 0, dc.width, dc.height);
-		detectData = dctx.getImageData(0, 0, dc.width, dc.height);
-		return await new Promise((resolve, reject) =>
-			canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('capture failed'))), 'image/jpeg', 0.85)
-		);
+	/** Live scan loop: detect features on the feed, capture when it's good. */
+	function startScanning() {
+		clearInterval(scanTimer);
+		goodStreak = 0;
+		bestSample = null;
+		scanStart = performance.now();
+		scanTimer = setInterval(() => {
+			if (phase !== 'aim') {
+				clearInterval(scanTimer);
+				return;
+			}
+			const s = sampleFrame(video);
+			if (!s) return;
+			if (!bestSample || s.score > bestSample.score) bestSample = s;
+			renderFeatureMesh(s.detect, s.features, 100);
+			goodStreak = s.features.length >= MIN_FEATURES ? goodStreak + 1 : 0;
+			if (goodStreak >= 2 || performance.now() - scanStart > SCAN_GIVE_UP_MS) {
+				void buildMap();
+			}
+		}, SCAN_TICK_MS);
 	}
 
-	/** Capture → compile the 3D map → boot tracking. Caulk unlocks at lock. */
+	/** Best frame → compile the 3D map → boot tracking. Caulk unlocks at lock. */
 	async function buildMap(sourceVideo?: HTMLVideoElement) {
 		try {
+			clearInterval(scanTimer);
 			phase = 'building';
 			buildPct = 0;
-			frame = await captureFrame(sourceVideo ?? video);
+			let sample = bestSample;
+			bestSample = null;
+			if (sourceVideo || !sample) sample = await burstSample(sourceVideo ?? video, 3);
+			if (!sample) throw new Error('camera not ready — try again');
+			frame = await encodeSample(sample);
+			detectData = sample.detect;
 			const compileInput = await downscaleJpeg(frame, 800);
-			showMesh();
+			renderFeatureMesh(sample.detect, sample.features, 0);
 			const target = await compileWallTarget(compileInput, (p) => {
 				buildPct = p;
 				updateMesh(p);
@@ -349,7 +363,15 @@
 		} catch (e) {
 			b.dispose();
 			const msg = errText(e);
-			showToast(msg.includes('insufficient') ? 'Spray can is empty!' : msg);
+			showToast(
+				msg.includes('insufficient')
+					? 'Spray can is empty!'
+					: /schema|function|pgrst/i.test(msg)
+						? 'Save failed — reload the app and try again'
+						: /fetch|network|load failed/i.test(msg)
+							? 'Offline — stroke not saved'
+							: msg
+			);
 		}
 	}
 
@@ -367,9 +389,9 @@
 		}
 	}
 
-	// ---- map-building mesh: REAL detected wall features, drawn over the feed --
+	// ---- live wall mesh: REAL detected features, drawn over the feed ---------
 
-	function showMesh() {
+	function ensureOverlay() {
 		if (!meshRenderer) {
 			meshRenderer = new THREE.WebGLRenderer({ canvas: overlay, alpha: true, antialias: true });
 			meshRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -385,11 +407,11 @@
 			});
 		}
 		overlay.style.display = 'block';
-		hideMesh();
-		if (!detectData) return;
+	}
 
-		// Real Shi-Tomasi corners on the captured wall frame, Delaunay-meshed.
-		const feats = detectFeatures(detectData, 300);
+	function renderFeatureMesh(detect: ImageData, feats: Feature[], revealPct: number) {
+		ensureOverlay();
+		hideMesh();
 		featureCount = feats.length;
 		const edges = triangulate(feats);
 		// Points reveal strongest-first; an edge appears once both ends exist.
@@ -398,9 +420,9 @@
 		// Map detection-image px → screen px with the video's object-fit: cover
 		const w = window.innerWidth;
 		const h = window.innerHeight;
-		const s = Math.max(w / detectData.width, h / detectData.height);
-		const offX = (w - detectData.width * s) / 2;
-		const offY = (h - detectData.height * s) / 2;
+		const s = Math.max(w / detect.width, h / detect.height);
+		const offX = (w - detect.width * s) / 2;
+		const offY = (h - detect.height * s) / 2;
 		const ox = (f: { x: number; y: number }) => offX + f.x * s - w / 2;
 		const oy = (f: { x: number; y: number }) => h / 2 - (offY + f.y * s);
 
@@ -429,7 +451,7 @@
 		meshGroup.add(pts);
 		meshGroup.userData = { lines, pts, pointCount: feats.length, edgeMaxRank };
 		meshScene!.add(meshGroup);
-		updateMesh(0);
+		updateMesh(revealPct);
 	}
 
 	function updateMesh(pct: number) {
@@ -448,11 +470,18 @@
 	}
 
 	function hideMesh() {
-		meshGroup?.parent?.remove(meshGroup);
+		if (!meshGroup) return;
+		meshGroup.parent?.remove(meshGroup);
+		// The scanner rebuilds this a few times per second — free GPU buffers.
+		for (const obj of meshGroup.children as Array<THREE.LineSegments | THREE.Points>) {
+			obj.geometry.dispose();
+			(obj.material as THREE.Material).dispose();
+		}
 		meshGroup = null;
 	}
 
 	function stopEverything() {
+		clearInterval(scanTimer);
 		clearTimeout(lockTimer);
 		clearTimeout(toastTimer);
 		meshRenderer?.setAnimationLoop(null);
@@ -484,7 +513,7 @@
 		<button class="chip" onclick={() => goto('/')}>‹</button>
 		<span class="chip status" class:ready={phase === 'ready'}>
 			{#if phase === 'boot'}Starting…
-			{:else if phase === 'aim'}MAPPING WALL…
+			{:else if phase === 'aim'}SCANNING WALL · {featureCount} pts
 			{:else if phase === 'building'}BUILDING 3D MAP · {buildPct.toFixed(0)}%{featureCount
 					? ` · ${Math.floor((featureCount * buildPct) / 100)} pts`
 					: ''}
@@ -501,6 +530,16 @@
 			<span class="meter-label">VOLUME</span>
 			<div class="meter-bar"><div class="meter-fill" style="height: {meterPct}%"></div></div>
 			<span class="meter-pct">{meterPct.toFixed(0)}%</span>
+		</div>
+	{/if}
+
+	{#if phase === 'aim'}
+		<div class="hud bottom">
+			<p class="tip">
+				{featureCount >= MIN_FEATURES
+					? 'Good wall — locking on…'
+					: 'Aim at a textured wall — more detail, better lock'}
+			</p>
 		</div>
 	{/if}
 

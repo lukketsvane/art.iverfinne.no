@@ -225,3 +225,27 @@ export function videoLuminance(video: HTMLVideoElement | null): number {
 		return 0.45;
 	}
 }
+
+/** Variance of the 4-neighbour Laplacian — a focus/motion-blur proxy. */
+export function sharpness(img: ImageData): number {
+	const w = img.width;
+	const h = img.height;
+	const d = img.data;
+	const gray = new Float32Array(w * h);
+	for (let i = 0, p = 0; i < w * h; i++, p += 4) {
+		gray[i] = 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2];
+	}
+	let sum = 0;
+	let sum2 = 0;
+	const n = (w - 2) * (h - 2);
+	for (let y = 1; y < h - 1; y++) {
+		for (let x = 1; x < w - 1; x++) {
+			const i = y * w + x;
+			const v = 4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - w] - gray[i + w];
+			sum += v;
+			sum2 += v * v;
+		}
+	}
+	const mean = sum / n;
+	return sum2 / n - mean * mean;
+}
