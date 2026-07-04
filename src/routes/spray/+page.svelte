@@ -7,7 +7,7 @@
 	import { nearbySpots, createSpot, placeVoxels, getProfile, errText } from '$lib/api';
 	import { VoxelBrush } from '$lib/voxel';
 	import { compileWallTarget, uploadSpotAssets, collectAveragedFix, downscaleJpeg } from '$lib/spots';
-	import { detectFeatures, triangulate } from '$lib/mesh';
+	import { detectFeatures, triangulate, avgLuminance } from '$lib/mesh';
 
 	import { fmtVolume, type Profile, type Spot } from '$lib/types';
 
@@ -209,7 +209,13 @@
 			filterMinCF: 0.0001,
 			filterBeta: 0.001
 		});
-		mindar.scene.add(new THREE.HemisphereLight(0xffffff, 0x334155, 2.4));
+		// Light the caulk like the room, not like a showroom: a dim scene gets
+		// dim paint, otherwise the blobs glow like stickers pasted on the feed.
+		const lum = detectData ? avgLuminance(detectData) : 0.45;
+		mindar.scene.add(new THREE.HemisphereLight(0xffffff, 0x334155, 0.5 + 2.6 * lum));
+		const key = new THREE.DirectionalLight(0xffffff, 0.2 + 1.1 * lum);
+		key.position.set(0.6, 1, 1.2);
+		mindar.scene.add(key);
 		const anchor = mindar.addAnchor(0);
 		anchorGroup = anchor.group;
 		tapPlane = new THREE.Mesh(
