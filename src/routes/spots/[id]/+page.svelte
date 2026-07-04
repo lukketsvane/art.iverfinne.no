@@ -299,11 +299,12 @@
 			mindar.renderer.setAnimationLoop(() => {
 				mindar.renderer.render(mindar.scene, mindar.camera);
 			});
-			const el = mindar.renderer.domElement as HTMLCanvasElement;
-			el.style.touchAction = 'none';
-			el.addEventListener('pointerdown', handlePointerDown);
-			el.addEventListener('pointermove', onPointerMove);
-			el.addEventListener('pointerup', handlePointerUp);
+			// MindAR appends its <video> ABOVE the renderer canvas, so canvas-level
+			// listeners never fire. Listen on the container: everything bubbles here.
+			container.style.touchAction = 'none';
+			container.addEventListener('pointerdown', handlePointerDown);
+			container.addEventListener('pointermove', onPointerMove);
+			container.addEventListener('pointerup', handlePointerUp);
 		} catch (e) {
 			phase = 'error';
 			errorMsg = e instanceof Error ? e.message : String(e);
@@ -314,11 +315,15 @@
 		clearTimeout(toastTimer);
 		try {
 			mindar?.renderer?.setAnimationLoop(null);
-			const el = mindar?.renderer?.domElement;
-			el?.removeEventListener('pointerdown', handlePointerDown);
-			el?.removeEventListener('pointermove', onPointerMove);
-			el?.removeEventListener('pointerup', handlePointerUp);
+			container?.removeEventListener('pointerdown', handlePointerDown);
+			container?.removeEventListener('pointermove', onPointerMove);
+			container?.removeEventListener('pointerup', handlePointerUp);
 			mindar?.stop();
+			// mindar.stop() doesn't reliably release the camera — do it ourselves.
+			for (const v of Array.from(container?.querySelectorAll('video') ?? [])) {
+				const st = (v as HTMLVideoElement).srcObject as MediaStream | null;
+				st?.getTracks().forEach((t) => t.stop());
+			}
 		} catch {
 			/* teardown must never throw */
 		}
@@ -326,7 +331,8 @@
 </script>
 
 <div class="spot-root" bind:this={container}>
-	<div class="hud top">
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="hud top" onpointerdown={(e) => e.stopPropagation()}>
 		<button class="chip" onclick={() => goto('/')}>‹ home</button>
 		{#if profile}<span class="chip">{fmtVolume(remaining)}</span>{/if}
 		<span class="chip" class:locked={phase === 'locked'}>
@@ -353,7 +359,8 @@
 	{/if}
 
 	{#if phase === 'locked' || phase === 'scanning'}
-		<div class="hud bottom">
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="hud bottom" onpointerdown={(e) => e.stopPropagation()}>
 			{#if strokeCost > 0}<span class="chip cost">−{strokeCost} cm³</span>{/if}
 			<div class="thickness">
 				{#each ['thin', 'medium', 'thick'] as const as t}
@@ -372,7 +379,8 @@
 	{/if}
 
 	{#if selectedTag}
-		<div class="sheet">
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="sheet" onpointerdown={(e) => e.stopPropagation()}>
 			<div class="sheet-head">
 				<strong>{selectedTag.model_url.replace('builtin:', '')}</strong>
 				<button class="chip" onclick={() => (selectedTag = null)}>✕</button>

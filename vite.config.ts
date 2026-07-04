@@ -4,6 +4,9 @@ import basicSsl from '@vitejs/plugin-basic-ssl';
 import { defineConfig } from 'vite';
 
 export default defineConfig(({ mode }) => ({
+	define: {
+		__BUILD_TS__: JSON.stringify(new Date().toISOString().slice(0, 16).replace('T', ' '))
+	},
 	plugins: [
 		// iOS requires a secure context for camera + deviceorientation:
 		// `npm run dev:https` serves the dev server over TLS on the LAN.
@@ -26,6 +29,10 @@ export default defineConfig(({ mode }) => ({
 				]
 			},
 			workbox: {
+				// Iteration phase: new builds take over immediately — no stale app.
+				skipWaiting: true,
+				clientsClaim: true,
+				cleanupOutdatedCaches: true,
 				// Never cache Supabase API traffic; cache app shell + models.
 				navigateFallback: '/index.html',
 				runtimeCaching: [
