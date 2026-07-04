@@ -71,6 +71,10 @@
 			Open camera
 		</button>
 
+		<button class="cta secondary" onclick={() => goto('/spots/new')} disabled={!profile}>
+			📸 New spot — precision wall anchor
+		</button>
+
 		<ul class="notes">
 			<li>Needs camera, location and motion access — grant all three when asked.</li>
 			<li>Tags stick to GPS positions: expect a few metres of drift. That's the MVP deal.</li>
@@ -170,6 +174,12 @@
 	}
 	.cta:disabled {
 		opacity: 0.5;
+	}
+	.cta.secondary {
+		background: var(--panel);
+		color: var(--text);
+		border: 1px solid rgba(255, 255, 255, 0.15);
+		font-size: 1rem;
 	}
 	.notes {
 		color: var(--muted);
