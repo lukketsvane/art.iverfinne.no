@@ -101,8 +101,8 @@ export function buildCaulk(
 	const mat = caulkMaterial();
 	const path = points.map(([x, y]) => new THREE.Vector3(x, y, z));
 	const curve = new THREE.CatmullRomCurve3(path, false, 'centripetal', 0.5);
-	const segments = Math.min(240, points.length * 4);
-	group.add(new THREE.Mesh(new THREE.TubeGeometry(curve, segments, radius, 12, false), mat));
+	const segments = Math.min(320, points.length * 6);
+	group.add(new THREE.Mesh(new THREE.TubeGeometry(curve, segments, radius, 16, false), mat));
 	const start = new THREE.Mesh(new THREE.SphereGeometry(radius, 16, 12), mat);
 	start.position.copy(path[0]);
 	const end = new THREE.Mesh(new THREE.SphereGeometry(radius * 1.28, 16, 12), mat);
