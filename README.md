@@ -61,13 +61,6 @@ migrates cleanly to the native + VPS version (v2). See `FEASIBILITY-2026.md` and
 Place a tag at your location → another iPhone within radius sees it in camera view →
 appraise it → creator's volume increases → volume limit blocks over-placement.
 
-## Native v2 — seamless cm-precision everywhere
-
-`native/` contains the Unity 6 + ARCore Geospatial client: global,
-centimetre-class, shared placement against Google VPS (no scanning, no
-markers), talking to the same Supabase backend. See `native/README.md`.
-Requires migrations 0001–0004.
-
 ## Known limits (by design, see docs/BRIEF.md)
 
 - GPS drift: tags float and shift by metres; rendered at eye level (alt logged, not used).
