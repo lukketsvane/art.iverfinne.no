@@ -2,13 +2,14 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { ensureSession } from '$lib/supabase';
+	import { ensureSession, supabase } from '$lib/supabase';
 	import { getTag } from '$lib/api';
 	import { itemById } from '$lib/library';
 	import { distanceM } from '$lib/ar/session';
 	import type { NearbyTag } from '$lib/types';
 
 	let tag = $state<NearbyTag | null>(null);
+	let spotId = $state<string | null>(null);
 	let distance = $state<number | null>(null);
 	let status = $state<'loading' | 'ready' | 'missing' | 'error'>('loading');
 
@@ -25,6 +26,12 @@
 				return;
 			}
 			status = 'ready';
+			const { data: row } = await supabase()
+				.from('tags')
+				.select('spot_id')
+				.eq('id', tag.id)
+				.maybeSingle();
+			spotId = (row?.spot_id as string | null) ?? null;
 			navigator.geolocation?.getCurrentPosition(
 				(pos) => {
 					if (tag) distance = distanceM(pos.coords.latitude, pos.coords.longitude, tag.lat, tag.lon);
@@ -60,9 +67,14 @@
 				</p>
 			</div>
 		</div>
-		<button class="cta" onclick={() => goto(`/ar?t=${tag!.id}`)}>Find it in AR</button>
+		<button
+			class="cta"
+			onclick={() => goto(spotId ? `/spots/${spotId}` : `/ar?t=${tag!.id}`)}
+		>
+			Find the wall
+		</button>
 		<p class="muted small">
-			The camera view shows an arrow and distance until you're close enough to see the tag.
+			Point your camera at the wall when you get there — the tag locks on, centimetre-precise.
 		</p>
 	{/if}
 </main>
