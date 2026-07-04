@@ -2,10 +2,11 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { ensureSession, isConfigured } from '$lib/supabase';
-	import { getProfile } from '$lib/api';
+	import { getProfile, myStats } from '$lib/api';
 	import type { Profile } from '$lib/types';
 
 	let profile = $state<Profile | null>(null);
+	let stats = $state<{ places: number; given: number; received: number } | null>(null);
 	let error = $state<string | null>(null);
 	let configured = $state(true);
 
@@ -20,6 +21,11 @@
 		try {
 			const userId = await ensureSession();
 			profile = await getProfile(userId);
+			try {
+				stats = await myStats();
+			} catch {
+				stats = null; // migration 0005 not applied yet
+			}
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		}
@@ -67,12 +73,20 @@
 			</div>
 		</div>
 
+		{#if stats}
+			<div class="card stats">
+				<div><strong>{stats.places}</strong><span>Places</span></div>
+				<div><strong>{stats.given}</strong><span>Appraisals given</span></div>
+				<div><strong>{stats.received}</strong><span>Appraisals received</span></div>
+			</div>
+		{/if}
+
 		<button class="cta" onclick={() => goto('/ar')} disabled={!profile}>
 			Open camera
 		</button>
 
 		<button class="cta secondary" onclick={() => goto('/spots/new')} disabled={!profile}>
-			📸 New spot — precision wall anchor
+			New spot — precision wall anchor
 		</button>
 
 		<ul class="notes">
@@ -174,6 +188,24 @@
 	}
 	.cta:disabled {
 		opacity: 0.5;
+	}
+	.stats {
+		display: flex;
+		justify-content: space-between;
+		text-align: center;
+	}
+	.stats div {
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+		flex: 1;
+	}
+	.stats strong {
+		font-size: 1.4rem;
+	}
+	.stats span {
+		color: var(--muted);
+		font-size: 0.75rem;
 	}
 	.cta.secondary {
 		background: var(--panel);
