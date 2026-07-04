@@ -1,6 +1,7 @@
 // See https://svelte.dev/docs/kit/types#app.d.ts
 declare global {
 	namespace App {}
+	const __BUILD_TS__: string;
 }
 
 declare module '$lib/vendor/mindar/mindar-image.prod.js' {

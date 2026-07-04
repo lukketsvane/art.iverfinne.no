@@ -51,22 +51,96 @@
 	let strokeGroups: THREE.Group[] = [];
 	let currentGroup: THREE.Group | null = null;
 	let blobIndex = 0;
+	let meshGroup: THREE.Group | null = null;
+
+	function rnd(k: number): number {
+		const x = Math.sin(k * 12.9898) * 43758.5453;
+		return x - Math.floor(x);
+	}
+
+	/** Blueprint mesh: violet wireframe + feature points revealed with progress. */
+	function showMesh() {
+		if (!scene) return;
+		hideMesh();
+		meshGroup = new THREE.Group();
+		const w = window.innerWidth;
+		const h = window.innerHeight;
+		const cols = 13;
+		const rows = 21;
+		const jit = (i: number, j: number, k: number) =>
+			(rnd(i * 37.1 + j * 17.7 + k * 5.3) - 0.5) * (w / cols) * 0.4;
+		const vx = (i: number, j: number): [number, number] => [
+			-w / 2 + (i * w) / cols + jit(i, j, 1),
+			h / 2 - (j * h) / rows + jit(i, j, 2)
+		];
+		const pos: number[] = [];
+		for (let j = 0; j <= rows; j++)
+			for (let i = 0; i < cols; i++) {
+				const a = vx(i, j);
+				const b = vx(i + 1, j);
+				pos.push(a[0], a[1], 1, b[0], b[1], 1);
+			}
+		for (let i = 0; i <= cols; i++)
+			for (let j = 0; j < rows; j++) {
+				const a = vx(i, j);
+				const b = vx(i, j + 1);
+				pos.push(a[0], a[1], 1, b[0], b[1], 1);
+			}
+		const lgeo = new THREE.BufferGeometry();
+		lgeo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+		const lines = new THREE.LineSegments(
+			lgeo,
+			new THREE.LineBasicMaterial({ color: 0x7b61ff, transparent: true, opacity: 0.5 })
+		);
+		meshGroup.add(lines);
+
+		const ppos: number[] = [];
+		const pointCount = 260;
+		for (let k = 0; k < pointCount; k++)
+			ppos.push((rnd(k + 1) - 0.5) * w, (rnd(k * 3 + 2) - 0.5) * h, 2);
+		const pgeo = new THREE.BufferGeometry();
+		pgeo.setAttribute('position', new THREE.Float32BufferAttribute(ppos, 3));
+		const pts = new THREE.Points(
+			pgeo,
+			new THREE.PointsMaterial({ color: 0xffffff, size: 3.5, transparent: true, opacity: 0.9 })
+		);
+		meshGroup.add(pts);
+		meshGroup.userData = { lines, pts, lineVerts: pos.length / 3, pointCount };
+		scene.add(meshGroup);
+		updateMesh(0);
+	}
+
+	function updateMesh(pct: number) {
+		if (!meshGroup) return;
+		const { lines, pts, lineVerts, pointCount } = meshGroup.userData as {
+			lines: THREE.LineSegments;
+			pts: THREE.Points;
+			lineVerts: number;
+			pointCount: number;
+		};
+		lines.geometry.setDrawRange(0, Math.floor((lineVerts * pct) / 100 / 2) * 2);
+		pts.geometry.setDrawRange(0, Math.floor((pointCount * pct) / 100));
+	}
+
+	function hideMesh() {
+		meshGroup?.parent?.remove(meshGroup);
+		meshGroup = null;
+	}
 
 	onMount(async () => {
 		try {
 			const userId = await ensureSession();
 			void getProfile(userId).then((p) => (profile = p));
-			const [mediaStream, fix] = await Promise.all([
-				navigator.mediaDevices.getUserMedia({
-					video: { facingMode: 'environment', width: { ideal: 1920 } }
-				}),
-				collectAveragedFix(3)
-			]);
-			gps = fix;
+			const forceNew = Boolean(page.url.searchParams.get('new'));
+			const gpsPromise = collectAveragedFix(forceNew ? 2 : 3).then((f) => (gps = f ?? gps));
+			const mediaStream = await navigator.mediaDevices.getUserMedia({
+				video: { facingMode: 'environment', width: { ideal: 1920 } }
+			});
+			const fix = forceNew ? null : await gpsPromise.then(() => gps);
 
 			// Auto-access: if a tracked wall is nearby, use it — invisible redirect.
 			// ?new=1 skips this (came here to spray a DIFFERENT wall).
-			if (fix && !page.url.searchParams.get('new')) {
+			if (fix && !forceNew) {
 				try {
 					const spots = await nearbySpots(fix.lat, fix.lon, 500);
 					if (spots.length > 0) {
@@ -104,8 +178,8 @@
 		scene.add(new THREE.HemisphereLight(0xffffff, 0x334155, 2.4));
 		const w = window.innerWidth;
 		const h = window.innerHeight;
-		camera = new THREE.OrthographicCamera(-w / 2, w / 2, h / 2, -h / 2, 0.1, 100);
-		camera.position.z = 10;
+		camera = new THREE.OrthographicCamera(-w / 2, w / 2, h / 2, -h / 2, 0.1, 2000);
+		camera.position.z = 500;
 		renderer.setAnimationLoop(() => {
 			if (renderer && scene && camera) renderer.render(scene, camera);
 		});
@@ -242,7 +316,12 @@
 		try {
 			saveLabel = 'Anchoring';
 			progress = 0;
-			const target = await compileWallTarget(frame, (p) => (progress = p));
+			showMesh();
+			const target = await compileWallTarget(frame, (p) => {
+				progress = p;
+				updateMesh(p);
+			});
+			updateMesh(100);
 
 			saveLabel = 'Saving';
 			gps = (await collectAveragedFix(1)) ?? gps;
@@ -269,6 +348,7 @@
 			stopEverything();
 			await goto(`/spots/${spot.id}`, { replaceState: true });
 		} catch (e) {
+			hideMesh();
 			phase = 'drawing';
 			errorMsg = e instanceof Error ? e.message : String(e);
 			setTimeout(() => (errorMsg = ''), 4000);
@@ -316,7 +396,7 @@
 		<span class="chip status">
 			{#if phase === 'boot'}Starting…{:else if phase === 'live'}NEW WALL — just draw
 			{:else if phase === 'drawing'}EXTRUDING 3D · {costPct.toFixed(0)}%
-			{:else if phase === 'saving'}{saveLabel} {saveLabel === 'Anchoring' ? `${progress.toFixed(0)}%` : '…'}{/if}
+			{:else if phase === 'saving'}{saveLabel === 'Anchoring' ? `BUILDING 3D MESH · ${progress.toFixed(0)}%` : `${saveLabel}…`}{/if}
 		</span>
 		{#if phase === 'drawing'}
 			<button class="chip" onclick={undo}>undo</button>
