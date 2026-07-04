@@ -85,13 +85,10 @@
 			SPRAY
 		</button>
 
-		<button class="cta secondary" onclick={() => goto('/spots/new')} disabled={!profile}>
-			New spot — photograph a wall
-		</button>
 
 		<ul class="notes">
 			<li>Needs camera and location access — grant both when asked.</li>
-			<li>SPRAY finds the nearest tagged wall with GPS, then locks on with the camera — centimetre-precise, shared by everyone.</li>
+			<li>SPRAY finds the nearest tagged wall with GPS — or turns the wall in front of you into one, automatically.</li>
 			<li>Hold &amp; drag on a locked wall to spray caulk; tap a tag to appraise it.</li>
 		</ul>
 	{/if}
@@ -206,12 +203,6 @@
 	.stats span {
 		color: var(--muted);
 		font-size: 0.75rem;
-	}
-	.cta.secondary {
-		background: var(--panel);
-		color: var(--text);
-		border: 1px solid rgba(255, 255, 255, 0.15);
-		font-size: 1rem;
 	}
 	.notes {
 		color: var(--muted);
