@@ -84,7 +84,7 @@
 		{#if previewUrl}
 			<img src={previewUrl} alt="wall preview" />
 		{:else}
-			<span>📸 Take wall photo</span>
+			<span>Take wall photo</span>
 		{/if}
 		<input type="file" accept="image/*" capture="environment" onchange={onPick} hidden />
 	</label>
@@ -92,8 +92,8 @@
 	<input class="name" type="text" placeholder="Name (optional)" bind:value={name} maxlength="60" />
 
 	<p class="muted small">
-		{#if gpsCollecting}📡 averaging GPS…{:else if gps}📍 position locked (±{gps.accuracy.toFixed(0)} m)
-		{:else}📍 GPS starts when you take the photo{/if}
+		{#if gpsCollecting}Averaging GPS…{:else if gps}Position locked (±{gps.accuracy.toFixed(0)} m)
+		{:else}GPS starts when you take the photo{/if}
 	</p>
 
 	{#if error}

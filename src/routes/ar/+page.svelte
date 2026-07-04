@@ -239,7 +239,7 @@
 	<div class="hud top">
 		<button class="chip" onclick={() => goto('/')}>‹ back</button>
 		{#if profile}
-			<span class="chip">🧯 {remaining.toFixed(0)} cm³</span>
+			<span class="chip">{remaining.toFixed(0)} cm³</span>
 		{/if}
 		<span class="chip" class:warn={!hasFix}>
 			{#if !hasFix}locating…{:else}±{accuracy?.toFixed(0)} m · {tags.length} tags{/if}
@@ -266,7 +266,7 @@
 		<div class="hud bottom">
 			{#if nearestSpot}
 				<button class="spot-banner" onclick={() => goto(`/spots/${nearestSpot!.id}`)}>
-					🧱 {nearestSpot.name ?? 'Spot'} · {nearestSpot.distance_m?.toFixed(0)} m ·
+					PRECISE · {nearestSpot.name ?? 'Spot'} · {nearestSpot.distance_m?.toFixed(0)} m ·
 					{nearestSpot.tag_count} tags — <strong>precise mode</strong>
 				</button>
 			{/if}
@@ -278,7 +278,7 @@
 						onclick={() => (selectedItem = item)}
 						title={item.name}
 					>
-						{item.preview}
+						{item.label}
 					</button>
 				{/each}
 			</div>
@@ -318,7 +318,7 @@
 					<span class="meta">appraised ✓</span>
 				{:else}
 					<button class="appraise" onclick={() => selectedTag && appraise(selectedTag)}>
-						👍 Appraise (+25 cm³ to creator)
+						Appraise (+25 cm³ to creator)
 					</button>
 				{/if}
 				<button class="chip" onclick={() => selectedTag && share(selectedTag)}>share</button>
@@ -400,7 +400,9 @@
 		border-radius: 0.8rem;
 		min-width: 3rem;
 		height: 3rem;
-		font-size: 1.4rem;
+		font-size: 0.8rem;
+		font-weight: 700;
+		letter-spacing: 0.04em;
 		display: flex;
 		flex-direction: column;
 		align-items: center;
