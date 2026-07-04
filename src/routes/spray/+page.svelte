@@ -53,10 +53,16 @@
 	let brush: VoxelBrush | null = null;
 	let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
-	// Superprecise gate: pose must hold still before caulking is allowed.
+	// Precision gate: pose must settle before caulking is allowed. Enter/exit
+	// thresholds differ (hysteresis) so hand tremor doesn't flicker the gate,
+	// and steady tracking unlocks it after a few seconds regardless.
 	let precise = $state(false);
 	const lastAnchorPos = new THREE.Vector3();
 	let poseEma = 1;
+	let readySince = 0;
+	const PRECISE_ENTER = 0.006; // ~6 mm/frame drift on a ~1 m wall
+	const PRECISE_EXIT = 0.018;
+	const PRECISE_TIMEOUT_MS = 4000; // tracking held this long → good enough
 
 	// overlay renderer: ONLY for the map-building wireframe on top of the feed
 	let meshRenderer: THREE.WebGLRenderer | null = null;
@@ -214,6 +220,8 @@
 
 		anchor.onTargetFound = () => {
 			phase = 'ready';
+			readySince = performance.now();
+			poseEma = 0.05; // converge from near-threshold, not from 1
 			clearTimeout(lockTimer);
 		};
 		anchor.onTargetLost = () => {
@@ -228,9 +236,11 @@
 		mindar.renderer.setAnimationLoop(() => {
 			if (phase === 'ready' && anchorGroup) {
 				anchorGroup.getWorldPosition(probe);
-				poseEma = poseEma * 0.88 + probe.distanceTo(lastAnchorPos) * 0.12;
+				poseEma = poseEma * 0.85 + probe.distanceTo(lastAnchorPos) * 0.15;
 				lastAnchorPos.copy(probe);
-				precise = poseEma < 0.0025; // ~2-3 mm frame-to-frame drift on a ~1 m wall
+				precise =
+					performance.now() - readySince > PRECISE_TIMEOUT_MS ||
+					(precise ? poseEma < PRECISE_EXIT : poseEma < PRECISE_ENTER);
 			} else {
 				precise = false;
 				poseEma = 1;
