@@ -4,13 +4,15 @@
 	import { page } from '$app/state';
 	import * as THREE from 'three';
 	import { ensureSession } from '$lib/supabase';
-	import { nearbySpots, createSpot, placeCaulk, getProfile } from '$lib/api';
+	import { nearbySpots, createSpot, placeVoxels, getProfile, errText } from '$lib/api';
+	import { VoxelBrush } from '$lib/voxel';
 	import { compileWallTarget, uploadSpotAssets, collectAveragedFix, downscaleJpeg } from '$lib/spots';
-	import { caulkMaterial, buildCaulk } from '$lib/library';
+
 	import { fmtVolume, type Profile, type Spot } from '$lib/types';
 
 	type Thickness = 'thin' | 'medium' | 'thick';
 	const CAULK_RADIUS: Record<Thickness, number> = { thin: 0.015, medium: 0.03, thick: 0.05 };
+	const VOX_SIZE: Record<Thickness, number> = { thin: 0.012, medium: 0.024, thick: 0.04 };
 	const LOCK_TIMEOUT_MS = 7000;
 
 	let video: HTMLVideoElement;
@@ -45,9 +47,13 @@
 	let lockTimer: ReturnType<typeof setTimeout> | undefined;
 
 	// stroke state (anchor space)
-	let stroke: Array<[number, number]> | null = null;
-	let strokePreview: THREE.Group | null = null;
+	let brush: VoxelBrush | null = null;
 	let toastTimer: ReturnType<typeof setTimeout> | undefined;
+
+	// Superprecise gate: pose must hold still before caulking is allowed.
+	let precise = $state(false);
+	const lastAnchorPos = new THREE.Vector3();
+	let poseEma = 1;
 
 	// overlay renderer: ONLY for the map-building wireframe on top of the feed
 	let meshRenderer: THREE.WebGLRenderer | null = null;
@@ -164,7 +170,7 @@
 			await bootTracking(URL.createObjectURL(target));
 		} catch (e) {
 			phase = 'error';
-			errorMsg = e instanceof Error ? e.message : String(e);
+			errorMsg = errText(e);
 		}
 	}
 
@@ -207,7 +213,17 @@
 		await mindar.start();
 		phase = 'locking';
 		armLockTimer();
+		const probe = new THREE.Vector3();
 		mindar.renderer.setAnimationLoop(() => {
+			if (phase === 'ready' && anchorGroup) {
+				anchorGroup.getWorldPosition(probe);
+				poseEma = poseEma * 0.88 + probe.distanceTo(lastAnchorPos) * 0.12;
+				lastAnchorPos.copy(probe);
+				precise = poseEma < 0.0025; // ~2-3 mm frame-to-frame drift on a ~1 m wall
+			} else {
+				precise = false;
+				poseEma = 1;
+			}
 			mindar.renderer.render(mindar.scene, mindar.camera);
 		});
 	}
@@ -265,67 +281,47 @@
 	}
 
 	function onDown(ev: PointerEvent) {
-		if (phase !== 'ready' || stroke) return;
+		// Only on a SUPERPRECISE, stabilized 3D plane.
+		if (phase !== 'ready' || !precise || brush) return;
 		const p = wallPoint(ev);
 		if (!p || !anchorGroup) return;
-		stroke = [[p.x, p.y]];
-		strokePreview = new THREE.Group();
-		anchorGroup.add(strokePreview);
-		addBead(p.x, p.y);
+		brush = new VoxelBrush(VOX_SIZE[thickness], depthCm / 100);
+		anchorGroup.add(brush.group);
+		brush.stampAt(p.x, p.y, CAULK_RADIUS[thickness]);
 	}
 
 	function onMove(ev: PointerEvent) {
-		if (!stroke || !strokePreview) return;
+		if (!brush) return;
 		const p = wallPoint(ev);
 		if (!p) return;
-		const last = stroke[stroke.length - 1];
-		const r = CAULK_RADIUS[thickness];
-		if (Math.hypot(p.x - last[0], p.y - last[1]) < r * 0.6 || stroke.length >= 200) return;
-		stroke.push([p.x, p.y]);
-		addBead(p.x, p.y);
-	}
-
-	function addBead(x: number, y: number) {
-		if (!strokePreview) return;
-		const r = CAULK_RADIUS[thickness];
-		const bead = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 14), caulkMaterial());
-		bead.position.set(x, y, depthCm / 100 + r * 0.2);
-		strokePreview.add(bead);
+		brush.stampAt(p.x, p.y, CAULK_RADIUS[thickness]);
 	}
 
 	async function onUp() {
-		if (!stroke) return;
-		const points = stroke;
-		const preview = strokePreview;
-		stroke = null;
-		strokePreview = null;
-		if (points.length < 2 || !anchorGroup) {
-			preview?.parent?.remove(preview);
+		if (!brush) return;
+		const b = brush;
+		brush = null;
+		if (b.cells.length < 1) {
+			b.dispose();
 			return;
 		}
-		const r = CAULK_RADIUS[thickness];
-		const z = depthCm / 100;
-		// Bead preview → smooth tube, in anchor (wall) space.
-		preview?.parent?.remove(preview);
-		const tube = buildCaulk(points, r, z);
-		anchorGroup.add(tube);
 		try {
 			if (!spotPromise) throw new Error('wall not anchored yet');
 			const spot = await spotPromise;
-			const placed = await placeCaulk({
+			const placed = await placeVoxels({
 				spotId: spot.id,
 				lat: spot.lat,
 				lon: spot.lon,
 				accuracy: gps?.accuracy ?? null,
-				points,
-				radius: r,
-				depth: z
+				cells: b.cells,
+				vox: VOX_SIZE[thickness],
+				depth: depthCm / 100
 			});
 			if (profile) profile = await getProfile(profile.id);
-			showToast(`−${fmtVolume(placed.volume_cm3)}`);
+			showToast(`−${fmtVolume(placed.volume_cm3)} · ${b.cells.length} voxels`);
 		} catch (e) {
-			tube.parent?.remove(tube);
-			const msg = e instanceof Error ? e.message : String(e);
+			b.dispose();
+			const msg = errText(e);
 			showToast(msg.includes('insufficient') ? 'Spray can is empty!' : msg);
 		}
 	}
@@ -467,7 +463,7 @@
 			{:else if phase === 'aim'}MAPPING WALL…
 			{:else if phase === 'building'}BUILDING 3D MAP · {buildPct.toFixed(0)}%
 			{:else if phase === 'locking'}{remapCount > 0 ? 'REMAPPING · ' : ''}LOCKING…
-			{:else if phase === 'ready'}3D MAP LOCKED{/if}
+			{:else if phase === 'ready'}{precise ? 'SUPERPRECISE ✓' : 'STABILIZING…'}{/if}
 		</span>
 		{#if spotId}
 			<button class="chip" onclick={share}>share</button>
@@ -499,9 +495,11 @@
 				{/each}
 			</div>
 			<p class="tip">
-				{phase === 'ready'
-					? 'Draw directly on the wall'
-					: 'Hold the camera on the wall you mapped…'}
+				{phase !== 'ready'
+					? 'Hold the camera on the wall you mapped…'
+					: precise
+						? 'Build on the wall — layer over layer'
+						: 'Hold still — stabilizing the plane…'}
 			</p>
 		</div>
 	{/if}

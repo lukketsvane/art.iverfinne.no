@@ -1,4 +1,10 @@
 import { supabase } from '$lib/supabase';
+
+/** Supabase errors are plain objects, not Error instances — extract sanely. */
+export function errText(e: unknown): string {
+	const m = (e as { message?: string })?.message;
+	return typeof m === 'string' && m ? m : String(e);
+}
 import type {
 	NearbyTag,
 	PlacementPose,
@@ -156,6 +162,28 @@ export async function placeCaulk(args: {
 		// Migration 0007 not applied yet — retry with the 0005 signature.
 		({ data, error } = await supabase().rpc('place_caulk', base));
 	}
+	if (error) throw error;
+	return data as { id: string; creator_id: string; volume_cm3: number; created_at: string };
+}
+
+export async function placeVoxels(args: {
+	spotId: string;
+	lat: number;
+	lon: number;
+	accuracy: number | null;
+	cells: Array<[number, number, number]>;
+	vox: number;
+	depth: number;
+}): Promise<{ id: string; creator_id: string; volume_cm3: number; created_at: string }> {
+	const { data, error } = await supabase().rpc('place_voxels', {
+		p_spot_id: args.spotId,
+		p_lat: args.lat,
+		p_lon: args.lon,
+		p_accuracy: args.accuracy,
+		p_cells: args.cells,
+		p_vox: args.vox,
+		p_depth: args.depth
+	});
 	if (error) throw error;
 	return data as { id: string; creator_id: string; volume_cm3: number; created_at: string };
 }

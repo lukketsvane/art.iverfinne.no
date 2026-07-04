@@ -4,7 +4,8 @@
 	import { page } from '$app/state';
 	import * as THREE from 'three';
 	import { ensureSession } from '$lib/supabase';
-	import { getSpot, spotTags, placeCaulk, appraiseTag, spotFileUrl, getProfile } from '$lib/api';
+	import { getSpot, spotTags, placeCaulk, appraiseTag, spotFileUrl, getProfile, errText } from '$lib/api';
+	import { buildVoxels, type VoxelCell } from '$lib/voxel';
 	import { distanceM } from '$lib/ar/session';
 	import { buildBuiltin, buildCaulk, caulkMaterial } from '$lib/library';
 	import { SPOT_SIZE_SCALE, fmtVolume, type Profile, type Spot, type SpotTag } from '$lib/types';
@@ -49,8 +50,10 @@
 	function addTagMesh(tag: SpotTag) {
 		if (!anchorGroup || tagObjects.has(tag.id) || !tag.spot_xy) return;
 		let obj: THREE.Object3D | null = null;
-		const xy = tag.spot_xy as { x?: number; y?: number; s?: number; points?: Array<[number, number]>; r?: number; z?: number };
-		if (tag.model_url === 'caulk' && xy.points && xy.r) {
+		const xy = tag.spot_xy as { x?: number; y?: number; s?: number; points?: Array<[number, number]>; r?: number; z?: number; cells?: VoxelCell[]; vox?: number };
+		if (tag.model_url === 'caulk' && xy.cells && xy.vox) {
+			obj = buildVoxels(xy.cells, xy.vox, xy.z ?? 0);
+		} else if (tag.model_url === 'caulk' && xy.points && xy.r) {
 			obj = buildCaulk(xy.points, xy.r, xy.z);
 		} else {
 			const builtinId = tag.model_url.startsWith('builtin:') ? tag.model_url.slice(8) : null;
@@ -169,7 +172,7 @@
 			showToast(`Sprayed! −${placed.volume_cm3.toFixed(0)} cm³`);
 		} catch (e) {
 			preview?.parent?.remove(preview);
-			const msg = e instanceof Error ? e.message : String(e);
+			const msg = errText(e);
 			showToast(msg.includes('insufficient') ? 'Spray can is empty!' : msg);
 		} finally {
 			placing = false;
@@ -222,7 +225,7 @@
 			selectedTag = { ...tag };
 			showToast('Appraised — creator gets +25 cm³');
 		} catch (e) {
-			const msg = e instanceof Error ? e.message : String(e);
+			const msg = errText(e);
 			showToast(msg.includes('own tag') ? "Can't appraise your own tag" : msg);
 		}
 	}
@@ -307,7 +310,7 @@
 			container.addEventListener('pointerup', handlePointerUp);
 		} catch (e) {
 			phase = 'error';
-			errorMsg = e instanceof Error ? e.message : String(e);
+			errorMsg = errText(e);
 		}
 	});
 
