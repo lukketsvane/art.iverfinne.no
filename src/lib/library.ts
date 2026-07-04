@@ -79,30 +79,35 @@ export function caulkMaterial(): THREE.Material {
 	});
 }
 
-/** Caulk stroke: chain of overlapping spheres along the path — the mockup look. */
-export function buildCaulk(points: Array<[number, number]>, radius: number): THREE.Group {
+/** Deterministic pseudo-random bead scale in [0.88, 1.14]. */
+export function caulkJitter(i: number): number {
+	const x = Math.sin(i * 12.9898) * 43758.5453;
+	return 0.88 + (x - Math.floor(x)) * 0.26;
+}
+
+/**
+ * Caulk stroke: one smooth glossy tube along a Catmull-Rom spline through the
+ * points, with rounded start cap and a slightly swollen release blob at the
+ * end — the mock look. `depth` = how far the bead stands off the wall.
+ */
+export function buildCaulk(
+	points: Array<[number, number]>,
+	radius: number,
+	depth?: number
+): THREE.Group {
 	const group = new THREE.Group();
+	if (points.length < 2) return group;
+	const z = depth ?? radius * 0.6;
 	const mat = caulkMaterial();
-	const geo = new THREE.SphereGeometry(radius, 20, 14);
-	const step = radius * 0.7;
-	for (let i = 0; i < points.length - 1; i++) {
-		const [x1, y1] = points[i];
-		const [x2, y2] = points[i + 1];
-		const segLen = Math.hypot(x2 - x1, y2 - y1);
-		const n = Math.max(1, Math.ceil(segLen / step));
-		for (let j = 0; j < n; j++) {
-			const t = j / n;
-			const blob = new THREE.Mesh(geo, mat);
-			blob.position.set(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, radius * 0.6);
-			group.add(blob);
-		}
-	}
-	const last = points[points.length - 1];
-	const cap = new THREE.Mesh(geo, mat);
-	cap.position.set(last[0], last[1], radius * 0.6);
-	// The nozzle-release blob is a touch bigger, like squeezed caulk.
-	cap.scale.setScalar(1.25);
-	group.add(cap);
+	const path = points.map(([x, y]) => new THREE.Vector3(x, y, z));
+	const curve = new THREE.CatmullRomCurve3(path, false, 'centripetal', 0.5);
+	const segments = Math.min(240, points.length * 4);
+	group.add(new THREE.Mesh(new THREE.TubeGeometry(curve, segments, radius, 12, false), mat));
+	const start = new THREE.Mesh(new THREE.SphereGeometry(radius, 16, 12), mat);
+	start.position.copy(path[0]);
+	const end = new THREE.Mesh(new THREE.SphereGeometry(radius * 1.28, 16, 12), mat);
+	end.position.copy(path[path.length - 1]);
+	group.add(start, end);
 	return group;
 }
 
