@@ -59,6 +59,15 @@ export async function placeTag(
 	};
 }
 
+/** Fetch one tag by id (share links / focus mode). distance_m is filled by the caller. */
+export async function getTag(tagId: string): Promise<NearbyTag | null> {
+	const { data, error } = await supabase().rpc('get_tag', { p_tag_id: tagId });
+	if (error) throw error;
+	const row = Array.isArray(data) ? data[0] : data;
+	if (!row) return null;
+	return { ...row, distance_m: 0, appraised: Boolean(row.appraised) } as NearbyTag;
+}
+
 export async function appraiseTag(tagId: string): Promise<void> {
 	const { error } = await supabase().rpc('appraise_tag', { p_tag_id: tagId });
 	if (error) throw error;
