@@ -233,9 +233,9 @@
 
 	async function onDown(ev: PointerEvent) {
 		if (phase === 'live') {
-			// The frame you draw on becomes the wall — freeze is invisible (same pixels).
+			// The frame under your first touch becomes the wall anchor — captured
+			// silently; the camera feed keeps running (no freeze).
 			await captureFrame();
-			video.pause();
 			phase = 'drawing';
 		}
 		if (phase !== 'drawing' || current) return;
@@ -305,7 +305,6 @@
 
 	function resumeLive() {
 		frame = null;
-		void video.play();
 		phase = 'live';
 	}
 
@@ -395,7 +394,7 @@
 		<button class="chip" onclick={() => goto('/')}>‹</button>
 		<span class="chip status">
 			{#if phase === 'boot'}Starting…{:else if phase === 'live'}NEW WALL — just draw
-			{:else if phase === 'drawing'}EXTRUDING 3D · {costPct.toFixed(0)}%
+			{:else if phase === 'drawing'}EXTRUDING 3D · {costPct > 0 && costPct < 1 ? '<1' : costPct.toFixed(0)}%
 			{:else if phase === 'saving'}{saveLabel === 'Anchoring' ? `BUILDING 3D MESH · ${progress.toFixed(0)}%` : `${saveLabel}…`}{/if}
 		</span>
 		{#if phase === 'drawing'}
@@ -433,7 +432,7 @@
 				<div class="panel">
 					<div class="panel-col">
 						<span class="panel-label">VOLUME COST</span>
-						<span class="panel-big">{costPct.toFixed(0)}%</span>
+						<span class="panel-big">{costPct > 0 && costPct < 1 ? '<1' : costPct.toFixed(0)}%</span>
 						<span class="panel-sub">−{fmtVolume(pendingCost)}</span>
 					</div>
 					<div class="panel-col">
