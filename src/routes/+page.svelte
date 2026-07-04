@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { ensureSession, isConfigured } from '$lib/supabase';
-	import { getProfile, myStats } from '$lib/api';
+	import { getProfile, myStats, errText } from '$lib/api';
 	import { fmtVolume, type Profile } from '$lib/types';
 
 	let profile = $state<Profile | null>(null);
@@ -27,7 +27,7 @@
 				stats = null; // migration 0005 not applied yet
 			}
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			error = errText(e);
 		}
 	});
 </script>

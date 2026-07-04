@@ -34,7 +34,14 @@ export function supabase(): SupabaseClient {
 export async function ensureSession(): Promise<string> {
 	const sb = supabase();
 	const { data } = await sb.auth.getSession();
-	if (data.session) return data.session.user.id;
+	if (data.session) {
+		// A locally stored session can outlive its user (backend reset, user
+		// deleted). Validate against the server; if dead, drop it and start
+		// over with a fresh anonymous account instead of failing every call.
+		const { data: u, error } = await sb.auth.getUser();
+		if (!error && u.user) return u.user.id;
+		await sb.auth.signOut({ scope: 'local' }).catch(() => {});
+	}
 	const { data: anon, error } = await sb.auth.signInAnonymously();
 	if (error || !anon.session) throw error ?? new Error('anonymous sign-in failed');
 	return anon.session.user.id;
